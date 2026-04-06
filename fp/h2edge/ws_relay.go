@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -42,6 +43,59 @@ func wsRelaySeconds() time.Duration {
 		n = 120
 	}
 	return time.Duration(n) * time.Second
+}
+
+func wsServerInterval() time.Duration {
+	s := strings.TrimSpace(os.Getenv("H2EDGE_WS_SERVER_INTERVAL_MS"))
+	if s == "" {
+		return 800 * time.Millisecond
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 10 {
+		return 800 * time.Millisecond
+	}
+	if n > 5000 {
+		n = 5000
+	}
+	return time.Duration(n) * time.Millisecond
+}
+
+func wsServerMsgBytes() int {
+	s := strings.TrimSpace(os.Getenv("H2EDGE_WS_SERVER_MSG_BYTES"))
+	if s == "" {
+		return 80
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 {
+		return 80
+	}
+	if n > wsMaxFrame {
+		n = wsMaxFrame
+	}
+	return n
+}
+
+func wsServerTextPayload(n int) []byte {
+	// Build a text frame payload of exactly n bytes (best-effort).
+	// Prefix is JSON-like and the rest is padding to reach n bytes.
+	base := []byte(`{"t":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `,"from":"fp-h2edge","pad":"`)
+	if n <= len(base)+2 {
+		// minimal valid JSON-ish string terminator
+		return []byte(`{"t":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `}`)
+	}
+	padLen := n - len(base) - 2 // for `"}`
+	if padLen < 0 {
+		padLen = 0
+	}
+	pad := bytes.Repeat([]byte("x"), padLen)
+	out := make([]byte, 0, len(base)+len(pad)+2)
+	out = append(out, base...)
+	out = append(out, pad...)
+	out = append(out, '"', '}')
+	if len(out) > wsMaxFrame {
+		out = out[:wsMaxFrame]
+	}
+	return out
 }
 
 func readWSFrame(r io.Reader) (opcode byte, payload []byte, err error) {
@@ -139,7 +193,7 @@ func relayWebSocket(in io.Reader, out net.Conn, max time.Duration) wsRelayStats 
 		}
 	}
 
-	tick := time.NewTicker(800 * time.Millisecond)
+	tick := time.NewTicker(wsServerInterval())
 	defer tick.Stop()
 	go func() {
 		for {
@@ -147,8 +201,7 @@ func relayWebSocket(in io.Reader, out net.Conn, max time.Duration) wsRelayStats 
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				msg := []byte(`{"t":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `,"from":"fp-h2edge"}`)
-				safeWrite(0x1, msg)
+				safeWrite(0x1, wsServerTextPayload(wsServerMsgBytes()))
 			}
 		}
 	}()

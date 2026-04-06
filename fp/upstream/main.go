@@ -129,6 +129,10 @@ func main() {
 	readmePath := env("FP_README_PATH", "/home/drzbodun/README.md")
 	publicHost := strings.TrimSpace(env("FP_PUBLIC_HOST", ""))
 	wsPublicURL := strings.TrimSpace(env("FP_WS_PUBLIC_URL", ""))
+	wsFanout := envInt("FP_WS_FANOUT", 2)
+	wsPayloadBytes := envInt("FP_WS_PAYLOAD_BYTES", 4096)
+	wsIntervalMs := envInt("FP_WS_INTERVAL_MS", 80)
+	wsBlastMaxMs := envInt("FP_WS_MAX_MS", 13000)
 	pcapIface := env("FP_PCAP_IFACE", "any")
 	// Дополнительные порты к уже обязательным 443+8443 (например 8080 для отладки).
 	pcapExtraPorts := strings.TrimSpace(env("FP_PCAP_EXTRA_PORTS", ""))
@@ -166,7 +170,7 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte(renderHTML(p, publicHost, wsPublicURL)))
+		_, _ = w.Write([]byte(renderHTML(p, publicHost, wsPublicURL, wsFanout, wsPayloadBytes, wsIntervalMs, wsBlastMaxMs)))
 	})
 
 	mux.HandleFunc("/api/all", func(w http.ResponseWriter, r *http.Request) {
@@ -724,7 +728,7 @@ func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 	}
 }
 
-func renderHTML(p Payload, publicHost string, wsPublicURL string) string {
+func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, wsPayloadBytes int, wsIntervalMs int, wsBlastMaxMs int) string {
 	prettyAll, _ := json.MarshalIndent(p, "", "  ")
 	prettyHdr, _ := json.MarshalIndent(p.Headers, "", "  ")
 
@@ -846,6 +850,10 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string) string {
       (function () {
         const initialWsFp = ` + jsonString(asString(asMap(p.TLS["ws"])["fp"])) + `;
         const wsPublicUrl = ` + jsonString(wsPublicURL) + `;
+        const wsFanout = ` + strconv.Itoa(clampInt(wsFanout, 1, 50)) + `;
+        const wsPayloadBytes = ` + strconv.Itoa(clampInt(wsPayloadBytes, 1, 1<<20)) + `;
+        const wsIntervalMs = ` + strconv.Itoa(clampInt(wsIntervalMs, 10, 2000)) + `;
+        const wsMaxMs = ` + strconv.Itoa(clampInt(wsBlastMaxMs, 500, 120000)) + `;
         let st = null;
 
         function filenameFromDisposition(cd) {
@@ -868,9 +876,16 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string) string {
           try { await fetch('/ws', { cache: 'no-store' }); } catch (_) {}
         }
 
+        function makePayload(n) {
+          const base = 'pcap-ping-' + Date.now() + '-';
+          if (n <= base.length) return base.slice(0, n);
+          const need = n - base.length;
+          return base + 'x'.repeat(need);
+        }
+
         function triggerWsHandshake() {
           return new Promise((resolve) => {
-            const maxMs = 13000;
+            const maxMs = wsMaxMs;
             let ws;
             let iv = null;
             try {
@@ -886,11 +901,58 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string) string {
             }, maxMs);
             ws.onopen = () => {
               iv = setInterval(() => {
-                try { ws.send('pcap-ping-' + Date.now()); } catch (_) {}
+                try { ws.send(makePayload(wsPayloadBytes)); } catch (_) {}
               }, 400);
             };
             ws.onerror = () => { if (iv) clearInterval(iv); clearTimeout(t); resolve(); };
             ws.onclose = () => { if (iv) clearInterval(iv); clearTimeout(t); resolve(); };
+          });
+        }
+
+        function triggerWsBlast() {
+          // Open multiple parallel sockets and send larger payloads frequently.
+          const conns = [];
+          const payload = makePayload(wsPayloadBytes);
+          const maxMs = wsMaxMs;
+          const n = wsFanout;
+          return new Promise((resolve) => {
+            let alive = 0;
+            let done = false;
+            const finish = () => {
+              if (done) return;
+              done = true;
+              for (const c of conns) {
+                try { if (c.iv) clearInterval(c.iv); } catch (_) {}
+                try { c.ws.close(); } catch (_) {}
+              }
+              resolve();
+            };
+
+            const t = setTimeout(finish, maxMs);
+            for (let i = 0; i < n; i++) {
+              let ws;
+              try {
+                ws = new WebSocket(wsUrl());
+              } catch (_) {
+                continue;
+              }
+              const c = { ws, iv: null };
+              conns.push(c);
+              ws.onopen = () => {
+                alive++;
+                c.iv = setInterval(() => {
+                  try { ws.send(payload); } catch (_) {}
+                }, wsIntervalMs);
+              };
+              ws.onerror = () => {};
+              ws.onclose = () => {
+                try { if (c.iv) clearInterval(c.iv); } catch (_) {}
+              };
+            }
+            // Even if some sockets fail to open, still run for the duration.
+            // Keep the timer; finish() will close everything.
+            void alive;
+            void t;
           });
         }
 
@@ -943,7 +1005,7 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string) string {
             // While capture is running, trigger /ws from the client so WS traffic appears in pcap.
             Promise.resolve()
               .then(() => triggerWsProbe())
-              .then(() => triggerWsHandshake())
+              .then(() => triggerWsBlast())
               .catch(() => {});
 
             pollDownloadViaIframe(tokenOnLoad).then(() => {
@@ -966,7 +1028,7 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string) string {
           if (!initialWsFp && wsTry < 3) {
             Promise.resolve()
               .then(() => triggerWsProbe())
-              .then(() => triggerWsHandshake())
+              .then(() => triggerWsBlast())
               .then(() => {
                 const sp3 = new URLSearchParams(location.search);
                 sp3.set('ws_try', String(wsTry + 1));
@@ -1205,6 +1267,28 @@ func env(k, def string) string {
 	v := strings.TrimSpace(os.Getenv(k))
 	if v == "" {
 		return def
+	}
+	return v
+}
+
+func envInt(k string, def int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
 	}
 	return v
 }

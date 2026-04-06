@@ -99,6 +99,10 @@ sudo certbot renew --dry-run --no-random-sleep-on-renew
 - `FP_ACCESS_LOG` — если `1`, логирует каждый HTTP запрос в journal (`method`, `path`, `status`, `bytes`, `dur`).
 - `FP_README_PATH` — путь к `README.md`, который отображается в `/readme` и `/api/readme`. Если не задан, `/readme` может вернуть `500` (зависит от того, где запущен сервис).
 - `FP_WS_PUBLIC_URL` — полный URL WebSocket для UI (переопределяет поведение по умолчанию). Если пусто, страница сама подключается к **`wss://<hostname>:8443/ws`** (и `ws://<hostname>:8443/ws` по HTTP).
+- `FP_WS_FANOUT` — сколько параллельных WebSocket соединений открывать во время capture (по умолчанию `2`).
+- `FP_WS_PAYLOAD_BYTES` — размер payload (в байтах), который браузер отправляет в WS во время capture (по умолчанию `4096`).
+- `FP_WS_INTERVAL_MS` — интервал отправки WS сообщений в миллисекундах (по умолчанию `80`).
+- `FP_WS_MAX_MS` — сколько миллисекунд держать WS “blast” (по умолчанию `13000`).
 - `FP_PCAP_EXTRA_PORTS` — **дополнительные** TCP-порты для `tcpdump` (через запятую), **в дополнение** к обязательным **`443` и `8443`** (они всегда включаются в фильтр, чтобы в `.pcap` попадали и HTTPS, и `wss` на отдельном listener).
 - `FP_PCAP_IFACE` — интерфейс для `tcpdump` (по умолчанию `any`)
 - `FP_PCAP_TCPDUMP` — путь до `tcpdump` (по умолчанию `/usr/sbin/tcpdump`)
@@ -110,6 +114,8 @@ sudo certbot renew --dry-run --no-random-sleep-on-renew
 
 - `H2EDGE_WS_LISTEN` — отдельный TLS listener **только HTTP/1.1** для полноценного WebSocket (например `0.0.0.0:8443`). Тот же сертификат, что и у основного listener. Если пусто — второй порт не поднимается.
 - `H2EDGE_WS_RELAY_SECONDS` — сколько секунд после `101 Switching Protocols` держать соединение и обмениваться WS-кадрами (по умолчанию `12`).
+- `H2EDGE_WS_SERVER_INTERVAL_MS` — как часто edge отправляет server→client WS сообщение во время relay (по умолчанию `800`).
+- `H2EDGE_WS_SERVER_MSG_BYTES` — размер server→client WS сообщения (байт) во время relay (по умолчанию `80`).
 - `H2EDGE_ACCESS_LOG` — если `1`, логирует каждый HTTP/2 запрос (включая проксирование) в journal.
 - `H2EDGE_WS_ACCESS_LOG` — если `1`, логирует каждый WS upgrade/relay на `:8443` (статистика кадров/байт/длительность).
 
