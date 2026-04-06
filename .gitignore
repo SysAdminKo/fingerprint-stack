@@ -1,0 +1,45 @@
+# Editor / local tooling (repo-local)
+.cursor/
+
+# OS/editor noise
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Go
+*.exe
+*.test
+*.out
+*.coverprofile
+coverage.out
+
+# Built binaries
+fp/fp-h2edge
+fp/fp-upstream
+fp/h2edge/fp-h2edge
+fp/upstream/fingerprint-upstream
+fp/**/bin/
+fp/**/.exe
+
+# Go workspace junk
+**/go.work
+**/go.work.sum
+
+# Capture outputs
+*.pcap
+*.pcapng
+*.zip
+*-api-all.json
+fp-pcaps/
+
+# Vendor clones with embedded git dirs
+fp/**/.git/
+
+# Local git history backups
+.git.bak-*
