@@ -95,10 +95,12 @@ sudo certbot renew --dry-run --no-random-sleep-on-renew
 
 Переменные окружения upstream:
 
+- `FP_PUBLIC_HOST` — домен/хост, который отображается в UI (например, в `<title>` страницы). Если не задано, берётся `Host` из запроса.
 - `FP_PCAP_IFACE` — интерфейс для `tcpdump` (по умолчанию `any`)
 - `FP_PCAP_TCPDUMP` — путь до `tcpdump` (по умолчанию `/usr/sbin/tcpdump`)
 - `FP_PCAP_SAVE_DIR` — директория, куда **сохраняются** все `.pcap` и рядом снапшот `/api/all` (по умолчанию `/var/lib/fp/pcap`)
 - `FP_PCAP_DIR` — директория для временных `.pcap` (legacy `/api/pcap`, по умолчанию `/tmp/fp-pcaps`)
+- `FP_TRUSTED_PROXY_CIDRS` — список CIDR (через запятую), откуда upstream **доверяет** proxy-заголовкам от edge (`X-*`, `JA3`, `X-Forwarded-For`). По умолчанию: `127.0.0.1/8,::1/128`
 
 Формат сохранения:
 
@@ -112,7 +114,8 @@ sudo certbot renew --dry-run --no-random-sleep-on-renew
 
 - `/var/run/p0f.sock`
 
-Upstream по `client_ip` (берётся из `X-Forwarded-For`) делает запрос в `p0f-client` и отображает/возвращает результат.
+Upstream по `client_ip` делает запрос в `p0f-client` и отображает/возвращает результат.
+`client_ip` берётся из `X-Forwarded-For` **только если** запрос пришёл от доверенного proxy (см. `FP_TRUSTED_PROXY_CIDRS`), иначе используется `RemoteAddr`.
 
 ### 6) TTL (eBPF/BCC)
 
@@ -210,6 +213,74 @@ sudo systemctl restart fp-netagent
 
 ---
 
+## Быстрая замена домена целиком (автоматизация)
+
+Скрипт `deploy/set-domain.sh` автоматизирует “переезд” на новый домен:
+
+- выпускает/обновляет сертификат Let’s Encrypt для нового домена через `certbot --standalone` (HTTP-01)
+- временно останавливает `fp-h2edge`, чтобы освободить `:80` для ACME challenge
+- обновляет пути `H2EDGE_CERT/H2EDGE_KEY` на `/etc/letsencrypt/live/<domain>/{fullchain.pem,privkey.pem}`
+- выставляет `FP_PUBLIC_HOST=<domain>` (чтобы UI отображал правильный домен)
+- пишет env-файлы в `/etc/fp/` и ставит systemd drop-in’ы, затем перезапускает `fp-upstream` и `fp-h2edge`
+
+Запуск:
+
+```bash
+cd /home/drzbodun/fingerprint-stack
+sudo ./deploy/set-domain.sh new.example.com --email you@example.com
+```
+
+Требования:
+
+- DNS `A/AAAA` для нового домена указывает на этот сервер
+- входящий `:80` доступен из интернета (для HTTP-01)
+- `certbot` установлен и работает
+
+Примечание: скрипт меняет **UI-домен** (`FP_PUBLIC_HOST`) и **TLS сертификат** (`H2EDGE_CERT/H2EDGE_KEY`). Сам по себе `FP_PUBLIC_HOST` сертификаты не перевыпускает.
+
+---
+
+## Полная установка на новый сервер (автоматически)
+
+Скрипт `deploy/install.sh` разворачивает проект на новом сервере “под ключ”:
+
+- ставит необходимые пакеты и зависимости (certbot, tcpdump, p0f, BCC/eBPF для TTL-агента, toolchain)
+- ставит Go (если нужно) и собирает `fp-h2edge` / `fp-upstream`
+- устанавливает бинарники в `/usr/local/bin`
+- создаёт и включает systemd-сервисы: `fp-h2edge`, `fp-upstream`, `fp-netagent`, `p0f`
+- может выпустить сертификат Let’s Encrypt для домена (certbot standalone) и сразу стартовать edge на `:80/:443`
+
+### Non-interactive (через CLI параметры)
+
+```bash
+cd /home/drzbodun/fingerprint-stack
+sudo ./deploy/install.sh --domain new.example.com --email you@example.com
+```
+
+### Установка на “чистый” сервер (скрипт сам клонирует репозиторий)
+
+```bash
+sudo ./deploy/install.sh \
+  --repo-url https://github.com/SysAdminKo/fingerprint-stack.git \
+  --install-dir /opt/fingerprint-stack \
+  --ref v1.2.3 \
+  --domain new.example.com \
+  --email you@example.com
+```
+
+Примечание: если запустить повторно с `--update yes` и без `--ref`, будет выбрана **дефолтная ветка `origin/HEAD`** (обычно `main`) и выполнен `git pull --ff-only`.
+
+### Interactive (задаёт вопросы, если не передано флагами)
+
+```bash
+cd /home/drzbodun/fingerprint-stack
+sudo ./deploy/install.sh
+```
+
+Поддерживаемые параметры см. в `./deploy/install.sh --help`.
+
+---
+
 ## Что является “Akamai-like” и какие ограничения
 
 Сейчас реализовано:
@@ -227,6 +298,18 @@ sudo systemctl restart fp-netagent
 - полный “Akamai HTTP fingerprint” и полноценная телеметрия **всех** фреймов (при необходимости расширяется в `fp-h2edge`)
 
 ---
+
+## Безопасность / доверительная граница (важно)
+
+`fp-upstream` отображает fingerprints, которые приходят от edge в виде заголовков (`X-H2-*`, `X-TLS-*`, `X-CH-*`, `X-JA4`, `JA3`, `X-HTTP-FP`, `X-WS-*`).
+
+Чтобы клиент не мог подделать эти значения, upstream **доверяет** `X-*` / `JA3` / `X-Forwarded-For` **только если запрос пришёл от доверенного proxy** (по `RemoteAddr`).
+
+- по умолчанию доверены только локальные адреса: `127.0.0.1/8,::1/128`
+- настраивается через `FP_TRUSTED_PROXY_CIDRS`
+
+Если `RemoteAddr` **не** входит в `FP_TRUSTED_PROXY_CIDRS`, upstream игнорирует `X-Forwarded-For` и все edge-заголовки (они будут пустыми в UI/API).
+В `/api/all` дополнительно добавлен блок `extra.trusted_proxy` с флагом `ok` и текущим списком `cidrs`.
 
 ## Быстрые проверки
 

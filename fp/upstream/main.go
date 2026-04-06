@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"net/http"
 	"os"
 	"os/exec"
@@ -46,6 +47,7 @@ type pcapJob struct {
 func main() {
 	addr := env("FP_LISTEN", "127.0.0.1:9000")
 	readmePath := env("FP_README_PATH", "/home/drzbodun/README.md")
+	publicHost := strings.TrimSpace(env("FP_PUBLIC_HOST", ""))
 	pcapIface := env("FP_PCAP_IFACE", "any")
 	pcapBin := env("FP_PCAP_TCPDUMP", "/usr/sbin/tcpdump")
 	// Persistent capture directory (pcap + json snapshots).
@@ -58,9 +60,11 @@ func main() {
 	jobsMu := &sync.Mutex{}
 	jobs := map[string]*pcapJob{}
 
+	trusted := parseTrustedProxyCIDRs(env("FP_TRUSTED_PROXY_CIDRS", "127.0.0.1/8,::1/128"))
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		p := buildPayload(r)
+		p := buildPayload(r, trusted)
 		// If this page load is associated with an active capture token,
 		// persist the /api/all snapshot next to the pcap.
 		if tok := strings.TrimSpace(r.URL.Query().Get("pcap_token")); tok != "" {
@@ -79,11 +83,11 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte(renderHTML(p)))
+		_, _ = w.Write([]byte(renderHTML(p, publicHost)))
 	})
 
 	mux.HandleFunc("/api/all", func(w http.ResponseWriter, r *http.Request) {
-		p := buildPayload(r)
+		p := buildPayload(r, trusted)
 		writeJSON(w, p)
 	})
 	mux.HandleFunc("/readme", func(w http.ResponseWriter, r *http.Request) {
@@ -160,7 +164,7 @@ func main() {
 		writeJSON(w, map[string]any{"path": readmePath, "readme": string(b)})
 	})
 	mux.HandleFunc("/api/clean", func(w http.ResponseWriter, r *http.Request) {
-		p := buildPayload(r)
+		p := buildPayload(r, trusted)
 		writeJSON(w, map[string]any{
 			"ja4": p.TLS["ja4"],
 			"ja3": p.TLS["ja3"],
@@ -176,26 +180,26 @@ func main() {
 		})
 	})
 	mux.HandleFunc("/api/tls", func(w http.ResponseWriter, r *http.Request) {
-		p := buildPayload(r)
+		p := buildPayload(r, trusted)
 		writeJSON(w, map[string]any{
 			"tls":          p.TLS,
 			"client_hello": p.CH,
 		})
 	})
 	mux.HandleFunc("/api/handshake", func(w http.ResponseWriter, r *http.Request) {
-		p := buildPayload(r)
+		p := buildPayload(r, trusted)
 		writeJSON(w, map[string]any{
 			"handshake": p.Extra["handshake_dump"],
 		})
 	})
 	mux.HandleFunc("/api/tcp", func(w http.ResponseWriter, r *http.Request) {
-		p := buildPayload(r)
+		p := buildPayload(r, trusted)
 		writeJSON(w, map[string]any{
 			"tcp": p.Extra["tcp_fingerprint"],
 		})
 	})
 	mux.HandleFunc("/api/ttl", func(w http.ResponseWriter, r *http.Request) {
-		p := buildPayload(r)
+		p := buildPayload(r, trusted)
 		writeJSON(w, map[string]any{
 			"ttl": p.Extra["ttl"],
 		})
@@ -476,52 +480,113 @@ func zipAddFile(zw *zip.Writer, name string, path string) error {
 	return err
 }
 
-func buildPayload(r *http.Request) Payload {
+type trustedProxySet struct {
+	prefixes []netip.Prefix
+	raw      string
+}
+
+func parseTrustedProxyCIDRs(s string) trustedProxySet {
+	raw := strings.TrimSpace(s)
+	if raw == "" {
+		raw = "127.0.0.1/8,::1/128"
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]netip.Prefix, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		pr, err := netip.ParsePrefix(p)
+		if err != nil {
+			continue
+		}
+		out = append(out, pr)
+	}
+	return trustedProxySet{prefixes: out, raw: raw}
+}
+
+func (t trustedProxySet) isTrusted(ipStr string) bool {
+	ipStr = strings.TrimSpace(ipStr)
+	if ipStr == "" {
+		return false
+	}
+	ip, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		return false
+	}
+	for _, pr := range t.prefixes {
+		if pr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 	now := time.Now().Format(time.RFC3339Nano)
 
 	raIP, raPort := splitHostPort(r.RemoteAddr)
-	xff := firstHeader(r, "X-Forwarded-For")
+	proxyTrusted := trusted.isTrusted(raIP)
+
+	xff := ""
+	if proxyTrusted {
+		xff = firstHeader(r, "X-Forwarded-For")
+	}
 	clientIP := firstClientIP(raIP, xff)
 
+	edgeHeader := func(k string) string {
+		if !proxyTrusted {
+			return ""
+		}
+		return firstHeader(r, k)
+	}
+	edgeHeaderAnyCase := func(k string) string {
+		if !proxyTrusted {
+			return ""
+		}
+		return firstHeaderAnyCase(r, k)
+	}
+
 	tls := map[string]any{
-		"ja4":         firstHeader(r, "X-JA4"),
-		"ja3":         firstHeaderAnyCase(r, "JA3"), // ja3 module sets request header "JA3"
-		"http_fp":     firstHeader(r, "X-HTTP-FP"),
+		"ja4":         edgeHeader("X-JA4"),
+		"ja3":         edgeHeaderAnyCase("JA3"), // edge sets request header "JA3"
+		"http_fp":     edgeHeader("X-HTTP-FP"),
 		"ws": map[string]any{
-			"fp":         firstHeader(r, "X-WS-FP"),
-			"origin":     firstHeader(r, "X-WS-Origin"),
-			"ua":         firstHeader(r, "X-WS-UA"),
-			"version":    firstHeader(r, "X-WS-Version"),
-			"extensions": mustJSONList[string](firstHeader(r, "X-WS-Extensions")),
-			"protocols":  mustJSONList[string](firstHeader(r, "X-WS-Protocols")),
+			"fp":         edgeHeader("X-WS-FP"),
+			"origin":     edgeHeader("X-WS-Origin"),
+			"ua":         edgeHeader("X-WS-UA"),
+			"version":    edgeHeader("X-WS-Version"),
+			"extensions": mustJSONList[string](edgeHeader("X-WS-Extensions")),
+			"protocols":  mustJSONList[string](edgeHeader("X-WS-Protocols")),
 		},
-		"h2_fp":       firstHeader(r, "X-H2-FP"),
-		"h2_settings": mustJSONList[string](firstHeader(r, "X-H2-Settings")),
-		"h2_window_incr": mustJSONList[uint32](firstHeader(r, "X-H2-Window-Incr")),
-		"h2_priority_frames": firstHeader(r, "X-H2-Priority-Frames"),
-		"version":     firstHeader(r, "X-TLS-Version"),
-		"cipher_suite": firstHeader(r, "X-TLS-Cipher"),
-		"alpn":        firstHeader(r, "X-TLS-Proto"),
-		"resumed":     firstHeader(r, "X-TLS-Resumed"),
-		"server_name": firstHeader(r, "X-TLS-SNI"),
+		"h2_fp":       edgeHeader("X-H2-FP"),
+		"h2_settings": mustJSONList[string](edgeHeader("X-H2-Settings")),
+		"h2_window_incr": mustJSONList[uint32](edgeHeader("X-H2-Window-Incr")),
+		"h2_priority_frames": edgeHeader("X-H2-Priority-Frames"),
+		"version":     edgeHeader("X-TLS-Version"),
+		"cipher_suite": edgeHeader("X-TLS-Cipher"),
+		"alpn":        edgeHeader("X-TLS-Proto"),
+		"resumed":     edgeHeader("X-TLS-Resumed"),
+		"server_name": edgeHeader("X-TLS-SNI"),
 	}
 
 	handshake := map[string]any{
-		"client_hello_record_b64":          firstHeader(r, "X-TLS-ClientHello-Record-B64"),
-		"server_handshake_records_b64":     firstHeader(r, "X-TLS-ServerHandshake-Records-B64"),
-		"server_hello_json":                mustJSONObj(firstHeader(r, "X-TLS-ServerHello-JSON")),
+		"client_hello_record_b64":          edgeHeader("X-TLS-ClientHello-Record-B64"),
+		"server_handshake_records_b64":     edgeHeader("X-TLS-ServerHandshake-Records-B64"),
+		"server_hello_json":                mustJSONObj(edgeHeader("X-TLS-ServerHello-JSON")),
 	}
 
 	ch := map[string]any{
-		"server_name":        firstHeader(r, "X-CH-Server-Name"),
-		"handshake_version":  firstHeader(r, "X-CH-Handshake-Version"),
-		"alpn":               mustJSONList[string](firstHeader(r, "X-CH-ALPN")),
-		"supported_versions": mustJSONList[uint16](firstHeader(r, "X-CH-Supported-Versions")),
-		"cipher_suites":      mustJSONList[uint16](firstHeader(r, "X-CH-Cipher-Suites")),
-		"extensions":         mustJSONList[uint16](firstHeader(r, "X-CH-Extensions")),
-		"curves":             mustJSONList[uint16](firstHeader(r, "X-CH-Curves")),
-		"points":             mustJSONList[uint8](firstHeader(r, "X-CH-Points")),
-		"signature_schemes":  mustJSONList[uint16](firstHeader(r, "X-CH-Signature-Schemes")),
+		"server_name":        edgeHeader("X-CH-Server-Name"),
+		"handshake_version":  edgeHeader("X-CH-Handshake-Version"),
+		"alpn":               mustJSONList[string](edgeHeader("X-CH-ALPN")),
+		"supported_versions": mustJSONList[uint16](edgeHeader("X-CH-Supported-Versions")),
+		"cipher_suites":      mustJSONList[uint16](edgeHeader("X-CH-Cipher-Suites")),
+		"extensions":         mustJSONList[uint16](edgeHeader("X-CH-Extensions")),
+		"curves":             mustJSONList[uint16](edgeHeader("X-CH-Curves")),
+		"points":             mustJSONList[uint8](edgeHeader("X-CH-Points")),
+		"signature_schemes":  mustJSONList[uint16](edgeHeader("X-CH-Signature-Schemes")),
 	}
 
 	// Sort request headers for readability in UI.
@@ -536,9 +601,9 @@ func buildPayload(r *http.Request) Payload {
 		"uri":          r.URL.RequestURI(),
 		// NOTE: upstream sees the proxy hop protocol (often HTTP/1.1).
 		// Prefer outer/client protocol if edge passes it through.
-		"proto":             firstNonEmpty(firstHeader(r, "X-Client-Proto"), r.Proto),
+		"proto":             firstNonEmpty(edgeHeader("X-Client-Proto"), r.Proto),
 		"proto_upstream":    r.Proto,
-		"proto_client_alpn": firstHeader(r, "X-Client-ALPN"),
+		"proto_client_alpn": edgeHeader("X-Client-ALPN"),
 		"remote_ip":    raIP,
 		"remote_port":  raPort,
 		"client_ip":    clientIP,
@@ -563,12 +628,16 @@ func buildPayload(r *http.Request) Payload {
 			"tcp_fingerprint": p0fFingerprint(clientIP),
 			"ttl":             ttlByIP(clientIP),
 			"handshake_dump":  handshake,
+			"trusted_proxy": map[string]any{
+				"ok":    proxyTrusted,
+				"cidrs": trusted.raw,
+			},
 			"note":            "HTTP/2 frame-level fingerprinting not implemented yet",
 		},
 	}
 }
 
-func renderHTML(p Payload) string {
+func renderHTML(p Payload, publicHost string) string {
 	prettyAll, _ := json.MarshalIndent(p, "", "  ")
 	prettyHdr, _ := json.MarshalIndent(p.Headers, "", "  ")
 
@@ -581,12 +650,20 @@ func renderHTML(p Payload) string {
 	points := asU8List(p.CH["points"])
 	sigs := asU16List(p.CH["signature_schemes"])
 
+	hostForTitle := strings.TrimSpace(publicHost)
+	if hostForTitle == "" {
+		hostForTitle = asString(p.Request["host"])
+	}
+	if hostForTitle == "" {
+		hostForTitle = "localhost"
+	}
+
 	return `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Fingerprint — kf58p1vqbctehrki.mooo.com</title>
+    <title>Fingerprint — ` + htmlEscape(hostForTitle) + `</title>
     <style>
       :root { color-scheme: light dark; }
       body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; }
