@@ -257,6 +257,26 @@ cd /home/drzbodun/fingerprint-stack
 sudo ./deploy/install.sh --domain new.example.com --email you@example.com
 ```
 
+### Установка одной командой (на новом сервере)
+
+Полный деплой (клонирование + зависимости + systemd + Let’s Encrypt):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SysAdminKo/fingerprint-stack/master/deploy/install.sh | sudo bash -s -- --domain YOUR.DOMAIN --email YOU@EXAMPLE.COM
+```
+
+Без выпуска сертификата (поставить сервисы и поднять локально/за прокси):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SysAdminKo/fingerprint-stack/master/deploy/install.sh | sudo bash -s -- --issue-cert no
+```
+
+Только план (без изменений на сервере):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SysAdminKo/fingerprint-stack/master/deploy/install.sh | bash -s -- --dry-run --issue-cert no
+```
+
 ### Установка на “чистый” сервер (скрипт сам клонирует репозиторий)
 
 ```bash
