@@ -24,7 +24,8 @@ struct ttl_stat_t {
 
 BPF_HASH(ttl_stats, u32, struct ttl_stat_t, 65536);
 
-int kprobe__ip_rcv(struct pt_regs *ctx, struct sk_buff *skb) {
+// Hook ip_rcv_core because some receive paths (e.g. GRO) bypass ip_rcv().
+int kprobe__ip_rcv_core(struct pt_regs *ctx, struct sk_buff *skb) {
   if (skb == NULL) return 0;
 
   // Read skb->head and skb->network_header to find IPv4 header

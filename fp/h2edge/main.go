@@ -156,9 +156,13 @@ func (s *Store) GetWS(ip string) (WSInfo, bool) {
 func main() {
 	listen := env("H2EDGE_LISTEN", "0.0.0.0:10443")
 	httpListen := env("H2EDGE_HTTP_LISTEN", "")
-	certFile := env("H2EDGE_CERT", "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/kf58p1vqbctehrki.mooo.com/kf58p1vqbctehrki.mooo.com.crt")
-	keyFile := env("H2EDGE_KEY", "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/kf58p1vqbctehrki.mooo.com/kf58p1vqbctehrki.mooo.com.key")
+	certFile := env("H2EDGE_CERT", "")
+	keyFile := env("H2EDGE_KEY", "")
 	upstream := env("H2EDGE_UPSTREAM", "http://127.0.0.1:9000")
+
+	if strings.TrimSpace(certFile) == "" || strings.TrimSpace(keyFile) == "" {
+		log.Fatalf("missing TLS cert/key: set H2EDGE_CERT and H2EDGE_KEY (e.g. /etc/letsencrypt/live/<domain>/fullchain.pem and /etc/letsencrypt/live/<domain>/privkey.pem)")
+	}
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {

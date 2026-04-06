@@ -1302,7 +1302,7 @@ func parseP0FOutput(ip, out string) any {
 func ttlByIP(ip string) any {
 	ip = strings.TrimSpace(ip)
 	if ip == "" {
-		return nil
+		return map[string]any{"ok": false, "reason": "empty_ip"}
 	}
 	base := env("TTL_API", "http://127.0.0.1:9100")
 	url := base + "/api/ttl/ip/" + ip
@@ -1313,18 +1313,22 @@ func ttlByIP(ip string) any {
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return map[string]any{"ip": ip, "error": err.Error()}
+		return map[string]any{"ip": ip, "ok": false, "reason": "ttl_api_error", "error": err.Error()}
 	}
 	defer resp.Body.Close()
 
 	var obj map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
-		return map[string]any{"ip": ip, "error": err.Error()}
+		return map[string]any{"ip": ip, "ok": false, "reason": "ttl_api_bad_json", "error": err.Error()}
 	}
 	if v, ok := obj["ttl"]; ok {
-		return v
+		// netagent returns {"ttl": null} when it has no data for this IP yet.
+		if v == nil {
+			return map[string]any{"ip": ip, "ok": false, "reason": "no_data_yet"}
+		}
+		return map[string]any{"ip": ip, "ok": true, "ttl": v}
 	}
-	return obj
+	return map[string]any{"ip": ip, "ok": false, "reason": "unexpected_response", "raw": obj}
 }
 
 func asString(v any) string {
