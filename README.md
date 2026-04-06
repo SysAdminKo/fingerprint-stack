@@ -96,11 +96,23 @@ sudo certbot renew --dry-run --no-random-sleep-on-renew
 Переменные окружения upstream:
 
 - `FP_PUBLIC_HOST` — домен/хост, который отображается в UI (например, в `<title>` страницы). Если не задано, берётся `Host` из запроса.
+- `FP_ACCESS_LOG` — если `1`, логирует каждый HTTP запрос в journal (`method`, `path`, `status`, `bytes`, `dur`).
+- `FP_WS_PUBLIC_URL` — полный URL WebSocket для UI (переопределяет поведение по умолчанию). Если пусто, страница сама подключается к **`wss://<hostname>:8443/ws`** (и `ws://<hostname>:8443/ws` по HTTP).
+- `FP_PCAP_EXTRA_PORTS` — **дополнительные** TCP-порты для `tcpdump` (через запятую), **в дополнение** к обязательным **`443` и `8443`** (они всегда включаются в фильтр, чтобы в `.pcap` попадали и HTTPS, и `wss` на отдельном listener).
 - `FP_PCAP_IFACE` — интерфейс для `tcpdump` (по умолчанию `any`)
 - `FP_PCAP_TCPDUMP` — путь до `tcpdump` (по умолчанию `/usr/sbin/tcpdump`)
 - `FP_PCAP_SAVE_DIR` — директория, куда **сохраняются** все `.pcap` и рядом снапшот `/api/all` (по умолчанию `/var/lib/fp/pcap`)
 - `FP_PCAP_DIR` — директория для временных `.pcap` (legacy `/api/pcap`, по умолчанию `/tmp/fp-pcaps`)
 - `FP_TRUSTED_PROXY_CIDRS` — список CIDR (через запятую), откуда upstream **доверяет** proxy-заголовкам от edge (`X-*`, `JA3`, `X-Forwarded-For`). По умолчанию: `127.0.0.1/8,::1/128`
+
+**`fp-h2edge` (edge, дополнительно):**
+
+- `H2EDGE_WS_LISTEN` — отдельный TLS listener **только HTTP/1.1** для полноценного WebSocket (например `0.0.0.0:8443`). Тот же сертификат, что и у основного listener. Если пусто — второй порт не поднимается.
+- `H2EDGE_WS_RELAY_SECONDS` — сколько секунд после `101 Switching Protocols` держать соединение и обмениваться WS-кадрами (по умолчанию `12`).
+- `H2EDGE_ACCESS_LOG` — если `1`, логирует каждый HTTP/2 запрос (включая проксирование) в journal.
+- `H2EDGE_WS_ACCESS_LOG` — если `1`, логирует каждый WS upgrade/relay на `:8443` (статистика кадров/байт/длительность).
+
+Для захвата трафика на `8443` в `.pcap` используйте `FP_PCAP_EXTRA_PORTS` (в `deploy/install.sh` по умолчанию добавлен `8443`) и откройте порт в firewall.
 
 Формат сохранения:
 

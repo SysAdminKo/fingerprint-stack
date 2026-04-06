@@ -71,6 +71,46 @@ type WSInfo struct {
 	Protocols  []string `json:"protocols,omitempty"`
 }
 
+type h2edgeLoggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *h2edgeLoggingResponseWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *h2edgeLoggingResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = 200
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += n
+	return n, err
+}
+
+func h2edgeAccessLogEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("H2EDGE_ACCESS_LOG"))
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func h2edgeWSLogEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("H2EDGE_WS_ACCESS_LOG"))
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func NewStore(ttl time.Duration) *Store {
 	return &Store{byH2: make(map[string]H2FP), byWS: make(map[string]WSInfo), ttl: ttl}
 }
@@ -152,6 +192,30 @@ func main() {
 		}()
 	}
 
+	wsListen := strings.TrimSpace(env("H2EDGE_WS_LISTEN", ""))
+	if wsListen != "" {
+		tlsCfgWS := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"http/1.1"},
+			MinVersion:   tls.VersionTLS12,
+		}
+		lnWS, err := net.Listen("tcp", wsListen)
+		if err != nil {
+			log.Fatalf("ws listen: %v", err)
+		}
+		log.Printf("h2edge ws (HTTP/1.1 only) listening on %s", wsListen)
+		go func() {
+			for {
+				c, err := lnWS.Accept()
+				if err != nil {
+					log.Printf("ws accept error: %v", err)
+					continue
+				}
+				go handleConnWSOnly(c, tlsCfgWS, store)
+			}
+		}()
+	}
+
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -160,6 +224,17 @@ func main() {
 		}
 		go handleConn(c, tlsCfg, store, rp)
 	}
+}
+
+func handleConnWSOnly(raw net.Conn, tlsCfg *tls.Config, store *Store) {
+	defer raw.Close()
+	tc := tls.Server(raw, tlsCfg)
+	_ = tc.SetDeadline(time.Now().Add(15 * time.Second))
+	if err := tc.Handshake(); err != nil {
+		return
+	}
+	_ = tc.SetDeadline(time.Time{})
+	handleHTTP1(tc, store)
 }
 
 func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.ReverseProxy) {
@@ -210,13 +285,15 @@ func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.Rev
 	srv := &http2.Server{}
 	srv.ServeConn(rc, &http2.ServeConnOpts{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			lw := &h2edgeLoggingResponseWriter{ResponseWriter: w}
 			switch r.URL.Path {
 			case "/api/h2":
 				// Retrieve latest capture for this remote if present
 				if latest, ok := store.Get(remote); ok {
 					fp = latest
 				}
-				writeJSON(w, map[string]any{"h2": fp, "tls": tlsfp, "tls_state": summarizeTLS(st)})
+				writeJSON(lw, map[string]any{"h2": fp, "tls": tlsfp, "tls_state": summarizeTLS(st)})
 				return
 			case "/ws":
 				// Best-effort: some clients may attempt WebSocket handshake over an h2 connection
@@ -227,11 +304,11 @@ func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.Rev
 				if ip != "" && wsi.Fingerprint != "" {
 					store.SetWS(ip, wsi)
 				}
-				w.Header().Set("X-WS-FP", wsi.Fingerprint)
-				writeJSON(w, map[string]any{"ok": true, "ws": wsi, "note": "websocket not proxied; fingerprint captured"})
+				lw.Header().Set("X-WS-FP", wsi.Fingerprint)
+				writeJSON(lw, map[string]any{"ok": true, "ws": wsi, "note": "websocket not proxied; fingerprint captured"})
 				return
 			case "/health":
-				writeJSON(w, map[string]any{"ok": true})
+				writeJSON(lw, map[string]any{"ok": true})
 				return
 			case "/__close":
 				// Force-close this HTTP/2 connection (best-effort) so the next browser request
@@ -300,7 +377,12 @@ func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.Rev
 					}
 				}
 				injectHeaders(r, st, fp, tlsfp)
-				rp.ServeHTTP(w, r)
+				rp.ServeHTTP(lw, r)
+			}
+			if h2edgeAccessLogEnabled() {
+				ip := remoteIPOnly(r.RemoteAddr)
+				log.Printf("h2 %s %s ip=%s status=%d bytes=%d dur_ms=%d ua=%q",
+					r.Method, r.URL.RequestURI(), ip, lw.status, lw.bytes, time.Since(start).Milliseconds(), r.UserAgent())
 			}
 		}),
 	})
@@ -318,7 +400,7 @@ func handleHTTP1(c net.Conn, store *Store) {
 
 	switch req.URL.Path {
 	case "/ws":
-		handleWSRequest(c, req, store)
+		handleWSRequest(c, br, req, store)
 		return
 	case "/health":
 		_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 26\r\n\r\n{\"ok\":true,\"proto\":\"h1\"}\n")
@@ -329,7 +411,7 @@ func handleHTTP1(c net.Conn, store *Store) {
 	}
 }
 
-func handleWSRequest(c net.Conn, r *http.Request, store *Store) {
+func handleWSRequest(c net.Conn, br *bufio.Reader, r *http.Request, store *Store) {
 	ip := remoteIPOnly(r.RemoteAddr)
 	wsi := computeWSInfo(r, ip)
 	if ip != "" && wsi.Fingerprint != "" {
@@ -352,17 +434,23 @@ func handleWSRequest(c net.Conn, r *http.Request, store *Store) {
 	}
 	accept := wsAccept(key)
 
-	// Minimal 101 response. We don't keep the WS open; handshake is enough for fingerprinting.
 	_, _ = io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\n")
 	_, _ = io.WriteString(c, "Upgrade: websocket\r\n")
 	_, _ = io.WriteString(c, "Connection: Upgrade\r\n")
 	_, _ = io.WriteString(c, "Sec-WebSocket-Accept: "+accept+"\r\n")
 	_, _ = io.WriteString(c, "X-WS-FP: "+wsi.Fingerprint+"\r\n")
 	_, _ = io.WriteString(c, "\r\n")
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		_ = c.Close()
-	}()
+
+	in := io.MultiReader(br, c)
+	start := time.Now()
+	stats := relayWebSocket(in, c, wsRelaySeconds())
+	if h2edgeWSLogEnabled() {
+		log.Printf("ws ip=%s ua=%q origin=%q fp=%s dur_ms=%d frames_in=%d bytes_in=%d frames_out=%d bytes_out=%d close=%t err=%q",
+			ip, r.UserAgent(), wsi.Origin, wsi.Fingerprint,
+			time.Since(start).Milliseconds(),
+			stats.FramesIn, stats.BytesIn, stats.FramesOut, stats.BytesOut, stats.CloseSeen, stats.ReadErr)
+	}
+	_ = c.Close()
 }
 
 func wsAccept(secKey string) string {
@@ -1284,7 +1372,7 @@ func h2hash(fp H2FP) string {
 func writeJSON(w http.ResponseWriter, v any) {
 	b, _ := json.MarshalIndent(v, "", "  ")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(200)
+	// Do not force status=200 here; keep any status set by caller.
 	_, _ = w.Write(b)
 	_, _ = w.Write([]byte("\n"))
 }

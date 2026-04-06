@@ -44,11 +44,94 @@ type pcapJob struct {
 	DurS      int
 }
 
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *loggingResponseWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *loggingResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = 200
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += n
+	return n, err
+}
+
+func accessLogEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("FP_ACCESS_LOG"))
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func withAccessLog(next http.Handler) http.Handler {
+	if !accessLogEnabled() {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lw := &loggingResponseWriter{ResponseWriter: w}
+		next.ServeHTTP(lw, r)
+		d := time.Since(start)
+		raIP, _ := splitHostPort(r.RemoteAddr)
+		log.Printf("http %s %s proto=%s host=%s ip=%s status=%d bytes=%d dur_ms=%d ua=%q",
+			r.Method, r.URL.RequestURI(), r.Proto, r.Host, raIP, lw.status, lw.bytes, d.Milliseconds(), firstHeader(r, "User-Agent"))
+	})
+}
+
+// tcpdumpHostPortFilter builds bpf: tcp and host <ip> and (port 443 or port 8443 ...).
+// 443 и 8443 всегда включены (HTTPS и отдельный WS listener), чтобы в .pcap попадал wss на 8443
+// даже если FP_PCAP_EXTRA_PORTS пустой или устаревший unit-файл.
+func tcpdumpHostPortFilter(targetIP string, extraPortsCSV string) []string {
+	ports := []string{"443", "8443"}
+	for _, seg := range strings.Split(extraPortsCSV, ",") {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			continue
+		}
+		dup := false
+		for _, p := range ports {
+			if p == seg {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			ports = append(ports, seg)
+		}
+	}
+	if len(ports) == 1 {
+		return []string{"tcp", "and", "host", targetIP, "and", "port", ports[0]}
+	}
+	out := []string{"tcp", "and", "host", targetIP, "and", "("}
+	for i, p := range ports {
+		if i > 0 {
+			out = append(out, "or")
+		}
+		out = append(out, "port", p)
+	}
+	out = append(out, ")")
+	return out
+}
+
 func main() {
 	addr := env("FP_LISTEN", "127.0.0.1:9000")
 	readmePath := env("FP_README_PATH", "/home/drzbodun/README.md")
 	publicHost := strings.TrimSpace(env("FP_PUBLIC_HOST", ""))
+	wsPublicURL := strings.TrimSpace(env("FP_WS_PUBLIC_URL", ""))
 	pcapIface := env("FP_PCAP_IFACE", "any")
+	// Дополнительные порты к уже обязательным 443+8443 (например 8080 для отладки).
+	pcapExtraPorts := strings.TrimSpace(env("FP_PCAP_EXTRA_PORTS", ""))
 	pcapBin := env("FP_PCAP_TCPDUMP", "/usr/sbin/tcpdump")
 	// Persistent capture directory (pcap + json snapshots).
 	pcapSaveDir := env("FP_PCAP_SAVE_DIR", "/var/lib/fp/pcap")
@@ -83,7 +166,7 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte(renderHTML(p, publicHost)))
+		_, _ = w.Write([]byte(renderHTML(p, publicHost, wsPublicURL)))
 	})
 
 	mux.HandleFunc("/api/all", func(w http.ResponseWriter, r *http.Request) {
@@ -255,8 +338,10 @@ func main() {
 				"-U",
 				"-n",
 				"-s", "0",
-				"tcp", "and", "host", job.TargetIP, "and", "port", "443",
 			}
+			bpfParts := tcpdumpHostPortFilter(job.TargetIP, pcapExtraPorts)
+			args = append(args, bpfParts...)
+			log.Printf("pcap start token=%s ip=%s bpf=%s", job.Token, job.TargetIP, strings.Join(bpfParts, " "))
 
 			cmd := exec.CommandContext(ctx, pcapBin, args...)
 			var stderr strings.Builder
@@ -303,11 +388,13 @@ func main() {
 			time.Sleep(30 * time.Millisecond)
 		}
 
+		bpfParts := tcpdumpHostPortFilter(targetIP, pcapExtraPorts)
 		writeJSON(w, map[string]any{
 			"ok":     true,
 			"token":  token,
 			"ip":     targetIP,
 			"dur_s":  durS,
+			"bpf":    strings.Join(bpfParts, " "),
 			"result": "/api/pcap/result?token=" + token,
 		})
 	})
@@ -397,15 +484,15 @@ func main() {
 		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(durS+2)*time.Second)
 		defer cancel()
 
-		// tcpdump filter: packets to/from clientIP on 443 (handshake + early HTTP/2 frames).
+		// tcpdump filter: packets to/from clientIP on 443 (and optional WS port, e.g. 8443).
 		args := []string{
 			"-i", pcapIface,
 			"-w", "-",
 			"-U",
 			"-n",
 			"-s", "0",
-			"tcp", "and", "host", targetIP, "and", "port", "443",
 		}
+		args = append(args, tcpdumpHostPortFilter(targetIP, pcapExtraPorts)...)
 
 		cmd := exec.CommandContext(ctx, pcapBin, args...)
 		stdout, err := cmd.StdoutPipe()
@@ -435,7 +522,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           withAccessLog(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -637,7 +724,7 @@ func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 	}
 }
 
-func renderHTML(p Payload, publicHost string) string {
+func renderHTML(p Payload, publicHost string, wsPublicURL string) string {
 	prettyAll, _ := json.MarshalIndent(p, "", "  ")
 	prettyHdr, _ := json.MarshalIndent(p.Headers, "", "  ")
 
@@ -758,6 +845,7 @@ func renderHTML(p Payload, publicHost string) string {
     <script>
       (function () {
         const initialWsFp = ` + jsonString(asString(asMap(p.TLS["ws"])["fp"])) + `;
+        const wsPublicUrl = ` + jsonString(wsPublicURL) + `;
         let st = null;
 
         function filenameFromDisposition(cd) {
@@ -767,28 +855,42 @@ func renderHTML(p Payload, publicHost string) string {
         }
 
         function wsUrl() {
-          const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-          return proto + '//' + location.host + '/ws';
+          if (wsPublicUrl) return wsPublicUrl;
+          const h = location.hostname;
+          const wsPort = '8443';
+          if (location.protocol === 'https:') {
+            return 'wss://' + h + ':' + wsPort + '/ws';
+          }
+          return 'ws://' + h + ':' + wsPort + '/ws';
         }
 
         async function triggerWsProbe() {
-          // Prefer a simple HTTP fetch to /ws (works even if /ws responds with JSON on h2).
           try { await fetch('/ws', { cache: 'no-store' }); } catch (_) {}
         }
 
         function triggerWsHandshake() {
           return new Promise((resolve) => {
-            let done = false;
-            const finish = () => { if (done) return; done = true; resolve(); };
+            const maxMs = 13000;
+            let ws;
+            let iv = null;
             try {
-              const ws = new WebSocket(wsUrl());
-              const t = setTimeout(() => { try { ws.close(); } catch (_) {} finish(); }, 900);
-              ws.onopen = () => { try { ws.close(); } catch (_) {} };
-              ws.onerror = () => { clearTimeout(t); finish(); };
-              ws.onclose = () => { clearTimeout(t); finish(); };
+              ws = new WebSocket(wsUrl());
             } catch (_) {
-              finish();
+              resolve();
+              return;
             }
+            const t = setTimeout(() => {
+              if (iv) clearInterval(iv);
+              try { ws.close(); } catch (_) {}
+              resolve();
+            }, maxMs);
+            ws.onopen = () => {
+              iv = setInterval(() => {
+                try { ws.send('pcap-ping-' + Date.now()); } catch (_) {}
+              }, 400);
+            };
+            ws.onerror = () => { if (iv) clearInterval(iv); clearTimeout(t); resolve(); };
+            ws.onclose = () => { if (iv) clearInterval(iv); clearTimeout(t); resolve(); };
           });
         }
 
@@ -956,7 +1058,7 @@ func renderHTML(p Payload, publicHost string) string {
             <tr><td class="k">Protocols</td><td class="v">` + htmlEscape(asString(asMap(p.TLS["ws"])["protocols"])) + `</td></tr>
           </table>
           <div class="hint" style="padding: 0 14px 14px 14px;">
-            Trigger a handshake via <code>wss://kf58p1vqbctehrki.mooo.com/ws</code> to populate these fields.
+            WebSocket по умолчанию: <code>wss://&lt;host&gt;:8443/ws</code> (отдельный TLS listener на edge). Переопределение: <code>FP_WS_PUBLIC_URL</code>. В <code>.pcap</code> порт 8443 учитывается через <code>FP_PCAP_EXTRA_PORTS</code>.
           </div>
         </section>
 
@@ -1030,7 +1132,7 @@ func renderHTML(p Payload, publicHost string) string {
 func writeJSON(w http.ResponseWriter, v any) {
 	b, _ := json.MarshalIndent(v, "", "  ")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(200)
+	// Do not force status=200 here; some handlers intentionally set non-200 (e.g. 202 while capturing).
 	_, _ = w.Write(b)
 	_, _ = w.Write([]byte("\n"))
 }
