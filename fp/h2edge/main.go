@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,15 @@ import (
 // This server terminates TLS+HTTP/2 and captures HTTP/2 frame-level signals (preface, SETTINGS, WINDOW_UPDATE, PRIORITY)
 // before handing the connection to http2.Server.ServeConn by replaying the bytes it already consumed.
 
+// H2FrameSample is one inbound client frame (metadata only; no HPACK payload).
+type H2FrameSample struct {
+	Type     string  `json:"type"`
+	StreamID uint32  `json:"stream_id"`
+	Length   uint32  `json:"length"`
+	Flags    uint8   `json:"flags"`
+	DeltaMs  float64 `json:"delta_ms,omitempty"` // ms since previous inbound frame (or since preface for first frame)
+}
+
 type H2FP struct {
 	AtUnix       int64             `json:"at_unix"`
 	RemoteAddr   string            `json:"remote_addr"`
@@ -39,7 +49,10 @@ type H2FP struct {
 	WindowIncr   []uint32          `json:"window_incr,omitempty"`
 	Priority     int               `json:"priority_frames"`
 	FramesSeen   map[string]int    `json:"frames_seen"`
-	Fingerprint  string            `json:"fingerprint"`
+	// FrameLog: ordered inbound frames (bounded); see H2EDGE_H2_MAX_FRAMES.
+	FrameLog    []H2FrameSample `json:"frame_log,omitempty"`
+	FrameTotal  int             `json:"frame_total,omitempty"`
+	Fingerprint string          `json:"fingerprint"`
 }
 
 type TLSFP struct {
@@ -54,10 +67,38 @@ type TLSFP struct {
 }
 
 type Store struct {
-	mu     sync.RWMutex
-	byH2   map[string]H2FP
-	byWS   map[string]WSInfo // ip -> ws handshake info
-	ttl    time.Duration
+	mu   sync.RWMutex
+	byH2 map[string]H2FP
+	byWS map[string]WSInfo // ip -> ws handshake info
+	ttl  time.Duration
+}
+
+// h2ConnTiming tracks spacing between requests and the previous response TTFB on one HTTP/2
+// connection (one handleConn / one TCP session). Lives in the handleConn closure — not keyed
+// by remote in a global map, so it cannot collide when a client reuses an ephemeral port later.
+// Concurrent streams on the same connection may interleave; interval/prev-TTFB are best-effort then.
+type h2ConnTiming struct {
+	mu            sync.Mutex
+	lastReqFinish time.Time // when previous handler finished (after upstream response)
+	lastTTFBMs    int64     // TTFB of previous request on this connection
+}
+
+// beginRequest returns interval since previous request ended and previous request TTFB (ms).
+func (c *h2ConnTiming) beginRequest() (intervalMs int64, prevTTFBMs int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.lastReqFinish.IsZero() {
+		intervalMs = time.Since(c.lastReqFinish).Milliseconds()
+	}
+	prevTTFBMs = c.lastTTFBMs
+	return
+}
+
+func (c *h2ConnTiming) endRequest(ttfbMs int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastTTFBMs = ttfbMs
+	c.lastReqFinish = time.Now()
 }
 
 type WSInfo struct {
@@ -91,6 +132,52 @@ func (w *h2edgeLoggingResponseWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func (w *h2edgeLoggingResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// ttfbWriter records time from start to first WriteHeader or Write (first byte to client).
+type ttfbWriter struct {
+	http.ResponseWriter
+	start time.Time
+	out   *int64
+	once  sync.Once
+}
+
+func (w *ttfbWriter) mark() {
+	w.once.Do(func() {
+		ms := time.Since(w.start).Milliseconds()
+		if w.out != nil {
+			*w.out = ms
+		}
+		w.Header().Set("X-Edge-TTFB-MS", strconv.FormatInt(ms, 10))
+	})
+}
+
+func (w *ttfbWriter) WriteHeader(code int) {
+	w.mark()
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *ttfbWriter) Write(p []byte) (int, error) {
+	w.mark()
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *ttfbWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+type edgeTiming struct {
+	RequestStartUnixNano int64
+	IntervalMs           int64
+	PrevTTFBMs           int64
+}
+
 func h2edgeAccessLogEnabled() bool {
 	v := strings.TrimSpace(os.Getenv("H2EDGE_ACCESS_LOG"))
 	switch strings.ToLower(v) {
@@ -112,7 +199,11 @@ func h2edgeWSLogEnabled() bool {
 }
 
 func NewStore(ttl time.Duration) *Store {
-	return &Store{byH2: make(map[string]H2FP), byWS: make(map[string]WSInfo), ttl: ttl}
+	return &Store{
+		byH2: make(map[string]H2FP),
+		byWS: make(map[string]WSInfo),
+		ttl:  ttl,
+	}
 }
 
 func (s *Store) Set(remote string, fp H2FP) {
@@ -285,12 +376,28 @@ func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.Rev
 		r:    io.MultiReader(bytes.NewReader(buf.Bytes()), tc),
 	}
 
+	reqTiming := &h2ConnTiming{}
+	var pcapTokMu sync.Mutex
+	var boundPcapToken string
+
 	// Serve HTTP/2 on the replay connection.
 	srv := &http2.Server{}
 	srv.ServeConn(rc, &http2.ServeConnOpts{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if t := strings.TrimSpace(r.URL.Query().Get("pcap_token")); t != "" {
+				pcapTokMu.Lock()
+				if boundPcapToken == "" {
+					boundPcapToken = t
+				}
+				pcapTokMu.Unlock()
+			}
+			intervalMs, prevTTFB := reqTiming.beginRequest()
+			reqStartNano := time.Now().UnixNano()
+			var ttfbMs int64
 			start := time.Now()
-			lw := &h2edgeLoggingResponseWriter{ResponseWriter: w}
+			tw := &ttfbWriter{ResponseWriter: w, start: start, out: &ttfbMs}
+			lw := &h2edgeLoggingResponseWriter{ResponseWriter: tw}
+			defer func() { reqTiming.endRequest(ttfbMs) }()
 			switch r.URL.Path {
 			case "/api/h2":
 				// Retrieve latest capture for this remote if present
@@ -323,9 +430,9 @@ func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.Rev
 				// `next` is provided, return a tiny HTML page that performs client-side redirect.
 				next := strings.TrimSpace(r.URL.Query().Get("next"))
 				if next != "" {
-					w.Header().Set("Content-Type", "text/html; charset=utf-8")
-					w.Header().Set("Cache-Control", "no-store")
-					_, _ = w.Write([]byte(`<!doctype html>
+					lw.Header().Set("Content-Type", "text/html; charset=utf-8")
+					lw.Header().Set("Cache-Control", "no-store")
+					_, _ = lw.Write([]byte(`<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8"/>
@@ -345,12 +452,10 @@ func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.Rev
     <script>location.replace(` + jsonString(next) + `);</script>
   </body>
 </html>`))
-					if f, ok := w.(http.Flusher); ok {
-						f.Flush()
-					}
+					lw.Flush()
 				} else {
-					w.Header().Set("Content-Type", "application/json; charset=utf-8")
-					_, _ = w.Write([]byte("{\"ok\":true}\n"))
+					lw.Header().Set("Content-Type", "application/json; charset=utf-8")
+					_, _ = lw.Write([]byte("{\"ok\":true}\n"))
 				}
 				go func() {
 					// Give browsers time to execute redirect JS before we kill the conn.
@@ -380,13 +485,24 @@ func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.Rev
 						}
 					}
 				}
-				injectHeaders(r, st, fp, tlsfp)
+				injectHeaders(r, st, fp, tlsfp, edgeTiming{
+					RequestStartUnixNano: reqStartNano,
+					IntervalMs:           intervalMs,
+					PrevTTFBMs:           prevTTFB,
+				})
 				rp.ServeHTTP(lw, r)
 			}
 			if h2edgeAccessLogEnabled() {
 				ip := remoteIPOnly(r.RemoteAddr)
-				log.Printf("h2 %s %s ip=%s status=%d bytes=%d dur_ms=%d ua=%q",
-					r.Method, r.URL.RequestURI(), ip, lw.status, lw.bytes, time.Since(start).Milliseconds(), r.UserAgent())
+				pcapTokMu.Lock()
+				pt := boundPcapToken
+				pcapTokMu.Unlock()
+				if pt == "" {
+					pt = "-"
+				}
+				log.Printf("h2 %s %s ip=%s status=%d bytes=%d dur_ms=%d interval_ms=%d prev_ttfb_ms=%d ttfb_ms=%d pcap_token=%s ua=%q",
+					r.Method, r.URL.RequestURI(), ip, lw.status, lw.bytes, time.Since(start).Milliseconds(),
+					intervalMs, prevTTFB, ttfbMs, pt, r.UserAgent())
 			}
 		}),
 	})
@@ -449,10 +565,14 @@ func handleWSRequest(c net.Conn, br *bufio.Reader, r *http.Request, store *Store
 	start := time.Now()
 	stats := relayWebSocket(in, c, wsRelaySeconds())
 	if h2edgeWSLogEnabled() {
-		log.Printf("ws ip=%s ua=%q origin=%q fp=%s dur_ms=%d frames_in=%d bytes_in=%d frames_out=%d bytes_out=%d close=%t err=%q",
+		pt := strings.TrimSpace(r.URL.Query().Get("pcap_token"))
+		if pt == "" {
+			pt = "-"
+		}
+		log.Printf("ws ip=%s ua=%q origin=%q fp=%s dur_ms=%d frames_in=%d bytes_in=%d frames_out=%d bytes_out=%d close=%t pcap_token=%s err=%q",
 			ip, r.UserAgent(), wsi.Origin, wsi.Fingerprint,
 			time.Since(start).Milliseconds(),
-			stats.FramesIn, stats.BytesIn, stats.FramesOut, stats.BytesOut, stats.CloseSeen, stats.ReadErr)
+			stats.FramesIn, stats.BytesIn, stats.FramesOut, stats.BytesOut, stats.CloseSeen, pt, stats.ReadErr)
 	}
 	_ = c.Close()
 }
@@ -570,6 +690,46 @@ func (w *writeRecorder) Bytes() []byte {
 	return out
 }
 
+func h2CaptureMS() time.Duration {
+	s := strings.TrimSpace(os.Getenv("H2EDGE_H2_CAPTURE_MS"))
+	if s == "" {
+		return 800 * time.Millisecond
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 50 {
+		return 800 * time.Millisecond
+	}
+	if n > 5000 {
+		n = 5000
+	}
+	return time.Duration(n) * time.Millisecond
+}
+
+func h2MaxFrames() int {
+	s := strings.TrimSpace(os.Getenv("H2EDGE_H2_MAX_FRAMES"))
+	if s == "" {
+		return 256
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 8 {
+		return 256
+	}
+	if n > 2048 {
+		return 2048
+	}
+	return n
+}
+
+func h2StopAfterHeaders() bool {
+	v := strings.TrimSpace(os.Getenv("H2EDGE_H2_STOP_AFTER_HEADERS"))
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func captureH2(c net.Conn, buf *bytes.Buffer, remote string) H2FP {
 	fp := H2FP{
 		AtUnix:     time.Now().Unix(),
@@ -587,18 +747,35 @@ func captureH2(c net.Conn, buf *bytes.Buffer, remote string) H2FP {
 	fp.FramesSeen["PREFACE"]++
 
 	fr := http2.NewFramer(io.MultiWriter(buf, io.Discard), io.TeeReader(c, buf))
-	// http2.Framer doesn't support deadlines; use conn deadline instead.
-	_ = c.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	captureWindow := h2CaptureMS()
+	maxFrames := h2MaxFrames()
+	stopEarly := h2StopAfterHeaders()
 
-	// Read a handful of initial frames (best-effort).
-	deadline := time.Now().Add(400 * time.Millisecond)
-	for time.Now().Before(deadline) {
+	_ = c.SetReadDeadline(time.Now().Add(captureWindow))
+	deadline := time.Now().Add(captureWindow)
+	lastFrameAt := time.Now()
+
+	for time.Now().Before(deadline) && len(fp.FrameLog) < maxFrames {
 		f, err := fr.ReadFrame()
 		if err != nil {
 			break
 		}
-		name := frameName(f)
+		deltaMs := time.Since(lastFrameAt).Seconds() * 1000
+		lastFrameAt = time.Now()
+		fp.FrameTotal++
+		h := f.Header()
+		name := h.Type.String()
 		fp.FramesSeen[name]++
+
+		if len(fp.FrameLog) < maxFrames {
+			fp.FrameLog = append(fp.FrameLog, H2FrameSample{
+				Type:     name,
+				StreamID: h.StreamID,
+				Length:   h.Length,
+				Flags:    uint8(h.Flags),
+				DeltaMs:  deltaMs,
+			})
+		}
 
 		switch t := f.(type) {
 		case *http2.SettingsFrame:
@@ -613,8 +790,7 @@ func captureH2(c net.Conn, buf *bytes.Buffer, remote string) H2FP {
 			fp.Priority++
 		}
 
-		// Stop early once we saw SETTINGS + first HEADERS (after that it's mostly request-specific).
-		if fp.FramesSeen["SETTINGS"] > 0 && fp.FramesSeen["HEADERS"] > 0 {
+		if stopEarly && fp.FramesSeen["SETTINGS"] > 0 && fp.FramesSeen["HEADERS"] > 0 {
 			break
 		}
 	}
@@ -650,7 +826,10 @@ func newReverseProxy(upstream string) *httputil.ReverseProxy {
 	return rp
 }
 
-func injectHeaders(r *http.Request, st tls.ConnectionState, h2fp H2FP, tlsfp TLSFP) {
+func injectHeaders(r *http.Request, st tls.ConnectionState, h2fp H2FP, tlsfp TLSFP, edge edgeTiming) {
+	// HTTP fingerprint from the client request only (before edge-injected headers below).
+	clientHTTPFP := computeHTTPFP(r)
+
 	// Frame-level HTTP/2 fingerprint
 	r.Header.Set("X-H2-FP", h2fp.Fingerprint)
 	if b, _ := json.Marshal(h2fp.SettingsList); len(b) > 0 {
@@ -660,6 +839,19 @@ func injectHeaders(r *http.Request, st tls.ConnectionState, h2fp H2FP, tlsfp TLS
 		r.Header.Set("X-H2-Window-Incr", string(b))
 	}
 	r.Header.Set("X-H2-Priority-Frames", fmt.Sprintf("%d", h2fp.Priority))
+	if len(h2fp.FrameLog) > 0 {
+		n := len(h2fp.FrameLog)
+		if n > 64 {
+			n = 64
+		}
+		if b, err := json.Marshal(h2fp.FrameLog[:n]); err == nil {
+			r.Header.Set("X-H2-Frame-Log", string(b))
+			if len(h2fp.FrameLog) > 64 {
+				r.Header.Set("X-H2-Frame-Log-Truncated", "1")
+			}
+		}
+	}
+	r.Header.Set("X-H2-Frame-Total", fmt.Sprintf("%d", h2fp.FrameTotal))
 
 	// What the client negotiated on the outer connection (useful since upstream sees the proxy hop).
 	if st.NegotiatedProtocol != "" {
@@ -692,8 +884,8 @@ func injectHeaders(r *http.Request, st tls.ConnectionState, h2fp H2FP, tlsfp TLS
 			r.Header.Set("X-TLS-ServerHello-JSON", string(b))
 		}
 	}
-	// HTTP-level fingerprint (approx)
-	r.Header.Set("X-HTTP-FP", computeHTTPFP(r))
+	// HTTP-level fingerprint (client-visible; computed at start of injectHeaders)
+	r.Header.Set("X-HTTP-FP", clientHTTPFP)
 	if m, ok := tlsfp.CH.(map[string]any); ok {
 		// Convert to the X-CH-* headers used by upstream
 		if v, _ := json.Marshal(m["alpn"]); len(v) > 0 {
@@ -724,19 +916,62 @@ func injectHeaders(r *http.Request, st tls.ConnectionState, h2fp H2FP, tlsfp TLS
 			r.Header.Set("X-CH-Handshake-Version", fmt.Sprintf("%v", hv))
 		}
 	}
+	r.Header.Set("X-Edge-Request-Start-Unix", strconv.FormatInt(edge.RequestStartUnixNano, 10))
+	if edge.IntervalMs > 0 {
+		r.Header.Set("X-Edge-Request-Interval-MS", strconv.FormatInt(edge.IntervalMs, 10))
+	}
+	if edge.PrevTTFBMs > 0 {
+		r.Header.Set("X-Edge-Prev-TTFB-MS", strconv.FormatInt(edge.PrevTTFBMs, 10))
+	}
+}
+
+func shouldSkipHeaderForFP(lk string) bool {
+	// Hop-by-hop / proxy / connection coalescing
+	switch lk {
+	case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade":
+		return true
+	}
+	if strings.HasPrefix(lk, "x-forwarded-") || lk == "x-real-ip" || lk == "forwarded" {
+		return true
+	}
+	return false
 }
 
 func computeHTTPFP(r *http.Request) string {
-	// Similar to caddy-httpfp: stable hash from header names + select values
+	// Similar to caddy-httpfp: stable hash from header names + select values.
+	// Excludes hop-by-hop and proxy headers; includes request target + pseudo-headers via Method/URL/Host.
 	names := make([]string, 0, len(r.Header))
 	for k := range r.Header {
-		names = append(names, strings.ToLower(k))
+		lk := strings.ToLower(k)
+		if shouldSkipHeaderForFP(lk) {
+			continue
+		}
+		names = append(names, lk)
 	}
 	sort.Strings(names)
 	get := func(k string) string { return strings.TrimSpace(r.Header.Get(k)) }
+
+	scheme := "https"
+	if r.TLS == nil {
+		scheme = "http"
+	}
+	if r.URL != nil && r.URL.Scheme != "" {
+		scheme = r.URL.Scheme
+	}
+	path := ""
+	qLen := 0
+	if r.URL != nil {
+		path = r.URL.Path
+		qLen = len(r.URL.RawQuery)
+	}
+
 	payload := map[string]any{
 		"proto":           r.Proto,
 		"method":          r.Method,
+		"scheme":          scheme,
+		"host":            r.Host,
+		"path":            path,
+		"query_len":       qLen,
 		"ua":              get("User-Agent"),
 		"accept":          get("Accept"),
 		"accept_lang":     get("Accept-Language"),
@@ -744,13 +979,21 @@ func computeHTTPFP(r *http.Request) string {
 		"sec_ch_ua":       get("Sec-CH-UA"),
 		"sec_ch_ua_mob":   get("Sec-CH-UA-Mobile"),
 		"sec_ch_ua_plat":  get("Sec-CH-UA-Platform"),
+		"sec_ch_ua_full":  get("Sec-CH-UA-Full-Version-List"),
+		"sec_ch_ua_model": get("Sec-CH-UA-Model"),
 		"sec_fetch_site":  get("Sec-Fetch-Site"),
 		"sec_fetch_mode":  get("Sec-Fetch-Mode"),
 		"sec_fetch_dest":  get("Sec-Fetch-Dest"),
 		"sec_fetch_user":  get("Sec-Fetch-User"),
+		"sec_fetch_storage": get("Sec-Fetch-Storage-Access"),
 		"upgrade_insecure": get("Upgrade-Insecure-Requests"),
 		"pragma":          get("Pragma"),
 		"cache_control":   get("Cache-Control"),
+		"referer_present": get("Referer") != "",
+		"dnt":             get("DNT"),
+		"viewport_width":  get("Viewport-Width"),
+		"device_memory":   get("Device-Memory"),
+		"origin":          get("Origin"),
 		"header_names":    names,
 	}
 	b, _ := json.Marshal(payload)
@@ -1342,31 +1585,28 @@ func parseSupportedVersions(raw []byte) []uint16 {
 	return nil
 }
 
-func frameName(f http2.Frame) string {
-	switch f.(type) {
-	case *http2.SettingsFrame:
-		return "SETTINGS"
-	case *http2.WindowUpdateFrame:
-		return "WINDOW_UPDATE"
-	case *http2.PriorityFrame:
-		return "PRIORITY"
-	case *http2.HeadersFrame:
-		return "HEADERS"
-	case *http2.DataFrame:
-		return "DATA"
-	default:
-		return "OTHER"
+func h2FrameSeq(fp H2FP) []string {
+	const max = 128
+	out := make([]string, 0, min(len(fp.FrameLog), max))
+	for i, s := range fp.FrameLog {
+		if i >= max {
+			break
+		}
+		out = append(out, fmt.Sprintf("%s:%d:%d", s.Type, s.StreamID, s.Flags))
 	}
+	return out
 }
 
 func h2hash(fp H2FP) string {
-	// Stable hash across the main H2 signals.
+	// Stable hash across the main H2 signals + compact frame sequence.
 	payload := map[string]any{
-		"settings":      fp.SettingsList,
-		"window_incr":   fp.WindowIncr,
-		"priority":      fp.Priority,
-		"frames_seen":   fp.FramesSeen,
-		"negotiated_h2": true,
+		"settings":       fp.SettingsList,
+		"window_incr":    fp.WindowIncr,
+		"priority":       fp.Priority,
+		"frames_seen":    fp.FramesSeen,
+		"frame_seq":      h2FrameSeq(fp),
+		"frame_total":    fp.FrameTotal,
+		"negotiated_h2":  true,
 	}
 	b, _ := json.Marshal(payload)
 	sum := sha256.Sum256(b)
@@ -1379,36 +1619,6 @@ func writeJSON(w http.ResponseWriter, v any) {
 	// Do not force status=200 here; keep any status set by caller.
 	_, _ = w.Write(b)
 	_, _ = w.Write([]byte("\n"))
-}
-
-func render(fp H2FP) string {
-	j, _ := json.MarshalIndent(fp, "", "  ")
-	return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>H2 Edge Fingerprint</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; }
-    header { padding: 20px 24px; border-bottom: 1px solid rgba(127,127,127,.25); }
-    main { padding: 20px 24px; max-width: 1100px; margin: 0 auto; }
-    pre { margin: 0; padding: 12px 14px; overflow: auto; font-size: 12.5px; line-height: 1.45; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; border: 1px solid rgba(127,127,127,.25); border-radius: 14px; }
-    a { color: inherit; }
-    .hint { opacity: .75; font-size: 13px; margin-top: 6px; }
-  </style>
-</head>
-<body>
-  <header>
-    <div style="font-weight:800; font-size:18px;">HTTP/2 frame-level fingerprint (edge)</div>
-    <div class="hint"><a href="/api/h2">/api/h2</a> • This endpoint must be the first HTTP/2 server to see frames.</div>
-  </header>
-  <main>
-    <pre>` + htmlEscape(string(j)) + `</pre>
-  </main>
-</body>
-</html>`
 }
 
 func htmlEscape(s string) string {

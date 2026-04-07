@@ -41,6 +41,7 @@ type pcapJob struct {
 	Started   bool
 	Err       string
 	StartedAt time.Time
+	EndedAt   time.Time // tcpdump finished; used for journalctl --until (stable if ZIP downloaded later)
 	DurS      int
 }
 
@@ -143,6 +144,7 @@ func main() {
 	// Temp directory used only for legacy /api/pcap streaming (kept for now).
 	pcapTmpDir := env("FP_PCAP_DIR", "/tmp/fp-pcaps")
 	_ = os.MkdirAll(pcapTmpDir, 0o700)
+	h2edgeJournalUnit := strings.TrimSpace(env("FP_H2EDGE_JOURNAL_UNIT", "fp-h2edge"))
 
 	jobsMu := &sync.Mutex{}
 	jobs := map[string]*pcapJob{}
@@ -360,8 +362,8 @@ func main() {
 				err = cmd.Wait()
 			}
 
+			completedAt := time.Now()
 			jobsMu.Lock()
-			defer jobsMu.Unlock()
 			if err != nil && ctx.Err() == nil {
 				job.Err = strings.TrimSpace(stderr.String())
 				if job.Err == "" {
@@ -369,6 +371,7 @@ func main() {
 				}
 			}
 			job.Ready = true
+			job.EndedAt = completedAt
 
 			// Cleanup old jobs (files are intentionally kept on disk).
 			cutoff := time.Now().Add(-10 * time.Minute)
@@ -377,6 +380,10 @@ func main() {
 					delete(jobs, k)
 				}
 			}
+			jobsMu.Unlock()
+
+			logPath := strings.TrimSuffix(job.Path, ".pcap") + "-h2edge.log"
+			writePcapH2EdgeLog(logPath, job.Token, job.StartedAt, job.EndedAt, h2edgeJournalUnit, job.TargetIP)
 		}()
 
 		// Wait briefly until tcpdump is actually running to avoid races
@@ -457,6 +464,19 @@ func main() {
 		} else {
 			fw, _ := zw.Create(filepath.Base(strings.TrimSuffix(filename, ".pcap") + "-api-all.json"))
 			_, _ = io.WriteString(fw, "{\"error\":\"api-all snapshot not found (try reloading the page with pcap_token during capture)\"}\n")
+		}
+		logPath := strings.TrimSuffix(job.Path, ".pcap") + "-h2edge.log"
+		if _, err := os.Stat(logPath); err != nil {
+			end := job.EndedAt
+			if end.IsZero() {
+				end = job.StartedAt.Add(time.Duration(job.DurS) * time.Second)
+			}
+			writePcapH2EdgeLog(logPath, job.Token, job.StartedAt, end, h2edgeJournalUnit, job.TargetIP)
+		}
+		if _, err := os.Stat(logPath); err == nil {
+			if err := zipAddFile(zw, filepath.Base(logPath), logPath); err != nil {
+				log.Printf("zip add h2edge log error: %v", err)
+			}
 		}
 	})
 	mux.HandleFunc("/api/pcap", func(w http.ResponseWriter, r *http.Request) {
@@ -571,6 +591,114 @@ func zipAddFile(zw *zip.Writer, name string, path string) error {
 	return err
 }
 
+// writePcapH2EdgeLog pulls fp-h2edge journal lines for this capture. Includes:
+//   - lines with pcap_token=<token>
+//   - h2 / ws access lines with ip=<TargetIP> (same client as tcpdump filter), so early requests
+//     with pcap_token=- are still present when H2EDGE_ACCESS_LOG=1.
+// Requires H2EDGE_ACCESS_LOG=1 / H2EDGE_WS_ACCESS_LOG=1 on edge for request lines.
+func writePcapH2EdgeLog(outPath, token string, startedAt, endedAt time.Time, unit, targetIP string) {
+	if strings.TrimSpace(unit) == "" {
+		unit = "fp-h2edge"
+	}
+	if endedAt.IsZero() {
+		endedAt = startedAt.Add(5 * time.Minute)
+	}
+	journalctl := "/usr/bin/journalctl"
+	if _, err := os.Stat(journalctl); err != nil {
+		journalctl = "journalctl"
+	}
+	// Wide window: __close navigation before start; traffic may finish slightly after tcpdump.
+	since := startedAt.Add(-4 * time.Minute)
+	until := endedAt.Add(5 * time.Minute)
+	args := []string{
+		"-u", unit,
+		"--since", since.Format("2006-01-02 15:04:05"),
+		"--until", until.Format("2006-01-02 15:04:05"),
+		"-o", "short-precise",
+		"--no-pager",
+	}
+	cmd := exec.Command(journalctl, args...)
+	out, jErr := cmd.CombinedOutput()
+	needleTok := "pcap_token=" + token
+
+	var matched []string
+	seen := map[string]struct{}{}
+	if jErr == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimRight(line, "\r")
+			if line == "" {
+				continue
+			}
+			if !h2edgeJournalLineWanted(line, needleTok, targetIP) {
+				continue
+			}
+			if _, ok := seen[line]; ok {
+				continue
+			}
+			seen[line] = struct{}{}
+			matched = append(matched, line)
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# fp-h2edge journal snippet (capture token ")
+	sb.WriteString(token)
+	sb.WriteString(", target ip ")
+	sb.WriteString(targetIP)
+	sb.WriteString(")\n# window: ")
+	sb.WriteString(since.UTC().Format(time.RFC3339))
+	sb.WriteString(" .. ")
+	sb.WriteString(until.UTC().Format(time.RFC3339))
+	sb.WriteString(" UTC\n")
+	sb.WriteString("# Includes: pcap_token=<token> OR ((\" h2 \" or \" ws ip=\") AND ip=<TargetIP>).\n")
+	if jErr != nil {
+		sb.WriteString("# journalctl failed: ")
+		sb.WriteString(jErr.Error())
+		sb.WriteString("\n")
+		if len(out) > 0 {
+			sb.WriteString(string(out))
+			if out[len(out)-1] != '\n' {
+				sb.WriteByte('\n')
+			}
+		}
+	}
+	for _, line := range matched {
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+	}
+	if jErr == nil && len(matched) == 0 {
+		sb.WriteString("# No lines matched. Enable H2EDGE_ACCESS_LOG=1 (and H2EDGE_WS_ACCESS_LOG=1 for WS).\n")
+		sb.WriteString("# Token-only lines need /?pcap_token=" + token + " on the H2 connection.\n")
+	}
+	_ = os.WriteFile(outPath, []byte(sb.String()), 0o600)
+}
+
+func h2edgeJournalLineWanted(line, needleTok, targetIP string) bool {
+	if strings.Contains(line, needleTok) {
+		return true
+	}
+	if targetIP == "" {
+		return false
+	}
+	ipTag := "ip=" + targetIP
+	idx := strings.Index(line, ipTag)
+	if idx < 0 {
+		return false
+	}
+	tail := line[idx+len(ipTag):]
+	if len(tail) > 0 && tail[0] != ' ' && tail[0] != '\t' {
+		return false
+	}
+	if strings.Contains(line, " h2 ") {
+		return true
+	}
+	// WS access line: "... ws ip=..." (no space between ws and ip)
+	if strings.Contains(line, " ws ip=") {
+		return true
+	}
+	return false
+}
+
 type trustedProxySet struct {
 	prefixes []netip.Prefix
 	raw      string
@@ -655,6 +783,9 @@ func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 		"h2_settings": mustJSONList[string](edgeHeader("X-H2-Settings")),
 		"h2_window_incr": mustJSONList[uint32](edgeHeader("X-H2-Window-Incr")),
 		"h2_priority_frames": edgeHeader("X-H2-Priority-Frames"),
+		"h2_frame_log":            mustJSONArr(edgeHeader("X-H2-Frame-Log")),
+		"h2_frame_log_truncated":  edgeHeader("X-H2-Frame-Log-Truncated"),
+		"h2_frame_total":          edgeHeader("X-H2-Frame-Total"),
 		"version":     edgeHeader("X-TLS-Version"),
 		"cipher_suite": edgeHeader("X-TLS-Cipher"),
 		"alpn":        edgeHeader("X-TLS-Proto"),
@@ -678,6 +809,23 @@ func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 		"curves":             mustJSONList[uint16](edgeHeader("X-CH-Curves")),
 		"points":             mustJSONList[uint8](edgeHeader("X-CH-Points")),
 		"signature_schemes":  mustJSONList[uint16](edgeHeader("X-CH-Signature-Schemes")),
+	}
+
+	edgeTiming := map[string]any{}
+	if v := strings.TrimSpace(edgeHeader("X-Edge-Request-Start-Unix")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			edgeTiming["request_start_unix_ns"] = n
+		}
+	}
+	if v := strings.TrimSpace(edgeHeader("X-Edge-Request-Interval-MS")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			edgeTiming["request_interval_ms"] = n
+		}
+	}
+	if v := strings.TrimSpace(edgeHeader("X-Edge-Prev-TTFB-MS")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			edgeTiming["prev_ttfb_ms"] = n
+		}
 	}
 
 	// Sort request headers for readability in UI.
@@ -719,11 +867,11 @@ func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 			"tcp_fingerprint": p0fFingerprint(clientIP),
 			"ttl":             ttlByIP(clientIP),
 			"handshake_dump":  handshake,
+			"edge_timing":     edgeTiming,
 			"trusted_proxy": map[string]any{
 				"ok":    proxyTrusted,
 				"cidrs": trusted.raw,
 			},
-			"note":            "HTTP/2 frame-level fingerprinting not implemented yet",
 		},
 	}
 }
@@ -740,6 +888,7 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
 	curves := asU16List(p.CH["curves"])
 	points := asU8List(p.CH["points"])
 	sigs := asU16List(p.CH["signature_schemes"])
+	edgeTiming := asMap(p.Extra["edge_timing"])
 
 	hostForTitle := strings.TrimSpace(publicHost)
 	if hostForTitle == "" {
@@ -825,6 +974,8 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
         border: 1px solid rgba(127,127,127,.25);
         border-radius: 8px;
       }
+      pre.json-block { max-height: 280px; margin: 0; padding: 12px 14px; overflow: auto; font-size: 12px; line-height: 1.45; }
+      section.subhint { padding: 0 14px 12px 14px; font-size: 12px; opacity: .8; border-top: 1px solid rgba(127,127,127,.12); }
     </style>
   </head>
   <body>
@@ -863,13 +1014,23 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
         }
 
         function wsUrl() {
-          if (wsPublicUrl) return wsPublicUrl;
+          const sp = new URLSearchParams(location.search);
+          const pt = sp.get('pcap_token');
+          if (wsPublicUrl) {
+            try {
+              const u = new URL(wsPublicUrl);
+              if (pt) u.searchParams.set('pcap_token', pt);
+              return u.toString();
+            } catch (_) {
+              return wsPublicUrl;
+            }
+          }
           const h = location.hostname;
           const wsPort = '8443';
-          if (location.protocol === 'https:') {
-            return 'wss://' + h + ':' + wsPort + '/ws';
-          }
-          return 'ws://' + h + ':' + wsPort + '/ws';
+          const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const u = new URL(proto + '//' + h + ':' + wsPort + '/ws');
+          if (pt) u.searchParams.set('pcap_token', pt);
+          return u.toString();
         }
 
         async function triggerWsProbe() {
@@ -1074,7 +1235,7 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
         <h2>Notice: what gets collected & saved</h2>
         <div class="box">
           <div class="text">
-            Нажимая <code>Capture .pcap</code>, вы запускаете серверный <code>tcpdump</code>. Будет сохранён <code>.pcap</code> с пакетами TCP/443 для вашего IP за выбранное время, а также рядом сохранится снапшот <code>/api/all</code> (request headers и fingerprints: JA3/JA4, TLS/ClientHello, H2/HTTP, p0f, TTL). Файлы сохраняются на сервере в директорию <code>FP_PCAP_SAVE_DIR</code>.
+            Нажимая <code>Capture .pcap</code>, вы запускаете серверный <code>tcpdump</code>. Будет сохранён <code>.pcap</code> с пакетами TCP/443 для вашего IP за выбранное время, рядом — снапшот <code>/api/all</code> (headers и fingerprints: JA3/JA4, TLS/ClientHello, H2/HTTP, p0f, TTL) и фрагмент journal <code>fp-h2edge</code> с вашим <code>pcap_token</code> (нужны <code>H2EDGE_ACCESS_LOG=1</code> на edge; при скачивании ZIP — три файла). Файлы сохраняются на сервере в <code>FP_PCAP_SAVE_DIR</code>.
           </div>
           <div class="actions">
             <label class="status" for="pcap_dur">pcap:</label>
@@ -1093,22 +1254,59 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
       </section>
       <div class="grid">
         <section>
-          <h2>Fingerprints + agreed TLS</h2>
+          <h2>TLS (agreed session)</h2>
           <table>
             <tr><td class="k">JA4</td><td class="v">` + htmlEscape(asString(p.TLS["ja4"])) + `</td></tr>
             <tr><td class="k">JA3</td><td class="v">` + htmlEscape(asString(p.TLS["ja3"])) + `</td></tr>
-            <tr><td class="k">WS fp (last)</td><td class="v">` + htmlEscape(asString(asMap(p.TLS["ws"])["fp"])) + `</td></tr>
             <tr><td class="k">TLS version</td><td class="v">` + htmlEscape(asString(p.TLS["version"])) + `</td></tr>
             <tr><td class="k">Cipher suite</td><td class="v">` + htmlEscape(asString(p.TLS["cipher_suite"])) + `</td></tr>
             <tr><td class="k">ALPN (agreed)</td><td class="v">` + htmlEscape(asString(p.TLS["alpn"])) + `</td></tr>
             <tr><td class="k">Resumed</td><td class="v">` + htmlEscape(asString(p.TLS["resumed"])) + `</td></tr>
             <tr><td class="k">SNI (agreed)</td><td class="v">` + htmlEscape(asString(p.TLS["server_name"])) + `</td></tr>
           </table>
-          <div class="hint" style="padding: 0 14px 14px 14px;">
-            HTTP/3 disabled to preserve TLS ClientHello fingerprints.
-          </div>
+          <div class="hint" style="padding: 0 14px 14px 14px;">HTTP/3 отключён, чтобы сохранять согласованный TLS/ALPN и ClientHello.</div>
         </section>
 
+        <section>
+          <h2>HTTP (application layer)</h2>
+          <table>
+            <tr><td class="k">HTTP fp</td><td class="v">` + htmlEscape(asString(p.TLS["http_fp"])) + `</td></tr>
+            <tr><td class="k">Method</td><td class="v">` + htmlEscape(asString(p.Request["method"])) + `</td></tr>
+            <tr><td class="k">Host</td><td class="v">` + htmlEscape(asString(p.Request["host"])) + `</td></tr>
+            <tr><td class="k">URI</td><td class="v">` + htmlEscape(asString(p.Request["uri"])) + `</td></tr>
+            <tr><td class="k">Proto (client)</td><td class="v">` + htmlEscape(asString(p.Request["proto"])) + `</td></tr>
+            <tr><td class="k">User-Agent</td><td class="v">` + htmlEscape(asString(p.Request["user_agent"])) + `</td></tr>
+            <tr><td class="k">Accept</td><td class="v">` + htmlEscape(asString(p.Request["accept"])) + `</td></tr>
+            <tr><td class="k">Accept-Language</td><td class="v">` + htmlEscape(asString(p.Request["accept_lang"])) + `</td></tr>
+            <tr><td class="k">Accept-Encoding</td><td class="v">` + htmlEscape(asString(p.Request["accept_enc"])) + `</td></tr>
+          </table>
+          <div class="subhint">Хэш <code>X-HTTP-FP</code> считается на edge до инъекции <code>X-H2-*</code> / <code>JA3</code> (см. <code>fp-h2edge</code>).</div>
+        </section>
+      </div>
+
+      <section>
+        <h2>HTTP/2 (frame-level, edge)</h2>
+        <table>
+          <tr><td class="k">H2 fp</td><td class="v">` + htmlEscape(asString(p.TLS["h2_fp"])) + `</td></tr>
+          <tr><td class="k">Frames (total seen)</td><td class="v">` + htmlEscape(asString(p.TLS["h2_frame_total"])) + `</td></tr>
+          <tr><td class="k">Priority frames</td><td class="v">` + htmlEscape(asString(p.TLS["h2_priority_frames"])) + `</td></tr>
+          <tr><td class="k">Frame log truncated</td><td class="v">` + htmlEscape(asString(p.TLS["h2_frame_log_truncated"])) + `</td></tr>
+        </table>
+        <div class="hint" style="padding: 8px 14px 4px 14px;">SETTINGS / WINDOW_UPDATE / inbound frame log — снимаются на <code>fp-h2edge</code> в начале соединения (см. <code>H2EDGE_H2_*</code>).</div>
+        <pre class="json-block">` + htmlEscape("settings:\n"+prettyJSON(p.TLS["h2_settings"])+"\n\nwindow_incr:\n"+prettyJSON(p.TLS["h2_window_incr"])+"\n\nframe_log:\n"+prettyJSON(p.TLS["h2_frame_log"])) + `</pre>
+      </section>
+
+      <section>
+        <h2>Edge timing</h2>
+        <table>
+          <tr><td class="k">Request start (unix ns)</td><td class="v">` + htmlEscape(asString(edgeTiming["request_start_unix_ns"])) + `</td></tr>
+          <tr><td class="k">Since previous response ended (ms)</td><td class="v">` + htmlEscape(asString(edgeTiming["request_interval_ms"])) + `</td></tr>
+          <tr><td class="k">Previous request TTFB (ms)</td><td class="v">` + htmlEscape(asString(edgeTiming["prev_ttfb_ms"])) + `</td></tr>
+        </table>
+        <div class="hint" style="padding: 0 14px 14px 14px;">Заголовки задаёт <code>fp-h2edge</code> на проксируемом запросе. Интервал — от конца предыдущего ответа edge до начала этого запроса на том же TCP-соединении. TTFB текущего ответа к клиенту — заголовок ответа <code>X-Edge-TTFB-MS</code>.</div>
+      </section>
+
+      <div class="grid">
         <section>
           <h2>WebSocket handshake (last)</h2>
           <table>
@@ -1125,18 +1323,17 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
         </section>
 
         <section>
-          <h2>Request details</h2>
+          <h2>Connection / routing</h2>
           <table>
-            <tr><td class="k">Method</td><td class="v">` + htmlEscape(asString(p.Request["method"])) + `</td></tr>
-            <tr><td class="k">Host</td><td class="v">` + htmlEscape(asString(p.Request["host"])) + `</td></tr>
-            <tr><td class="k">URI</td><td class="v">` + htmlEscape(asString(p.Request["uri"])) + `</td></tr>
-            <tr><td class="k">Proto (client)</td><td class="v">` + htmlEscape(asString(p.Request["proto"])) + `</td></tr>
-            <tr><td class="k">Proto (upstream)</td><td class="v">` + htmlEscape(asString(p.Request["proto_upstream"])) + `</td></tr>
-            <tr><td class="k">ALPN (client)</td><td class="v">` + htmlEscape(asString(p.Request["proto_client_alpn"])) + `</td></tr>
+            <tr><td class="k">Proto (upstream hop)</td><td class="v">` + htmlEscape(asString(p.Request["proto_upstream"])) + `</td></tr>
+            <tr><td class="k">ALPN (client, outer TLS)</td><td class="v">` + htmlEscape(asString(p.Request["proto_client_alpn"])) + `</td></tr>
             <tr><td class="k">Remote</td><td class="v">` + htmlEscape(asString(p.Request["remote_ip"])) + `:` + htmlEscape(asString(p.Request["remote_port"])) + `</td></tr>
             <tr><td class="k">Client IP</td><td class="v">` + htmlEscape(asString(p.Request["client_ip"])) + `</td></tr>
             <tr><td class="k">X-Forwarded-For</td><td class="v">` + htmlEscape(asString(p.Request["xff"])) + `</td></tr>
-            <tr><td class="k">User-Agent</td><td class="v">` + htmlEscape(asString(p.Request["user_agent"])) + `</td></tr>
+            <tr><td class="k">CF-Connecting-IP</td><td class="v">` + htmlEscape(asString(p.Request["cf_ip"])) + `</td></tr>
+            <tr><td class="k">True-Client-IP</td><td class="v">` + htmlEscape(asString(p.Request["true_client"])) + `</td></tr>
+            <tr><td class="k">Via</td><td class="v">` + htmlEscape(asString(p.Request["via"])) + `</td></tr>
+            <tr><td class="k">Forwarded</td><td class="v">` + htmlEscape(asString(p.Request["forwarded"])) + `</td></tr>
           </table>
         </section>
       </div>
@@ -1215,6 +1412,18 @@ func mustJSONObj(s string) any {
 		return nil
 	}
 	var out any
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return map[string]any{"_raw": s, "_error": err.Error()}
+	}
+	return out
+}
+
+// mustJSONArr parses a JSON array (e.g. H2 frame log from edge).
+func mustJSONArr(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var out []any
 	if err := json.Unmarshal([]byte(s), &out); err != nil {
 		return map[string]any{"_raw": s, "_error": err.Error()}
 	}
@@ -1413,6 +1622,17 @@ func ttlByIP(ip string) any {
 		return map[string]any{"ip": ip, "ok": true, "ttl": v}
 	}
 	return map[string]any{"ip": ip, "ok": false, "reason": "unexpected_response", "raw": obj}
+}
+
+func prettyJSON(v any) string {
+	if v == nil {
+		return "null"
+	}
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		b, _ = json.Marshal(v)
+	}
+	return string(b)
 }
 
 func asString(v any) string {

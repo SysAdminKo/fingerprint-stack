@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
-	"crypto/sha1"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -150,12 +149,3 @@ func writeClientFrame(w io.Writer, opcode byte, payload []byte) error {
 	_, err := w.Write(masked)
 	return err
 }
-
-func wsAccept(secKey string) string {
-	const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	sum := sha1.Sum([]byte(secKey + guid))
-	return base64.StdEncoding.EncodeToString(sum[:])
-}
-
-// Ensure unused helper isn't optimized away in tiny builds (keeps parity with server)
-var _ = wsAccept
