@@ -386,9 +386,13 @@ func main() {
 			writePcapH2EdgeLog(logPath, job.Token, job.StartedAt, job.EndedAt, h2edgeJournalUnit, job.TargetIP)
 		}()
 
-		// Wait briefly until tcpdump is actually running to avoid races
-		// where the browser reconnects before capture starts.
-		deadline := time.Now().Add(900 * time.Millisecond)
+		// Wait until tcpdump is actually running to avoid races where the browser
+		// reconnects (and sends ClientHello) before capture starts.
+		//
+		// We intentionally wait a bit longer than “feels necessary” because missing
+		// the first TCP segment(s) of the ClientHello is enough for Wireshark to show
+		// a different handshake than what edge captured in JSON.
+		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
 			jobsMu.Lock()
 			started := job.Started
@@ -771,6 +775,7 @@ func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 		"ja4":         edgeHeader("X-JA4"),
 		"ja3":         edgeHeaderAnyCase("JA3"), // edge sets request header "JA3"
 		"http_fp":     edgeHeader("X-HTTP-FP"),
+		"remote_addr": edgeHeader("X-TLS-Remote-Addr"),
 		"ws": map[string]any{
 			"fp":         edgeHeader("X-WS-FP"),
 			"origin":     edgeHeader("X-WS-Origin"),
@@ -795,6 +800,8 @@ func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 
 	handshake := map[string]any{
 		"client_hello_record_b64":          edgeHeader("X-TLS-ClientHello-Record-B64"),
+		"client_hello_record_len":          edgeHeader("X-TLS-ClientHello-Record-Len"),
+		"client_hello_record_hex_prefix":   edgeHeader("X-TLS-ClientHello-Record-Hex"),
 		"server_handshake_records_b64":     edgeHeader("X-TLS-ServerHandshake-Records-B64"),
 		"server_hello_json":                mustJSONObj(edgeHeader("X-TLS-ServerHello-JSON")),
 	}
@@ -1163,6 +1170,20 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
           if (tokenOnLoad) {
             btn.disabled = true;
             st.textContent = 'capturing...';
+            // If we just navigated via /__close (pcap_step=1), close once more quickly
+            // to maximize the chance that the token request and subsequent traffic are on
+            // a fresh TCP/TLS connection captured from the start.
+            const step = sp.get('pcap_step');
+            if (step === '1') {
+              sp.set('pcap_step', '2');
+              const next2 = location.pathname + '?' + sp.toString() + location.hash;
+              setTimeout(() => navClose(next2), 350);
+            } else if (step === '2') {
+              // Clean up the helper param; keep token.
+              sp.delete('pcap_step');
+              const next = location.pathname + '?' + sp.toString() + location.hash;
+              history.replaceState(null, '', next);
+            }
             // While capture is running, trigger /ws from the client so WS traffic appears in pcap.
             Promise.resolve()
               .then(() => triggerWsProbe())
@@ -1212,10 +1233,17 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
               const j = await resp.json();
               if (!j || !j.token) throw new Error('bad response');
               st.textContent = 'reconnecting...';
+              // Small client-side delay as an extra safety net: even if /api/pcap/start
+              // returned, browsers can be very fast to reuse/establish connections.
+              await new Promise(r => setTimeout(r, 400));
               const sp2 = new URLSearchParams(location.search);
               sp2.set('pcap_token', j.token);
-              const next = location.pathname + '?' + sp2.toString() + location.hash;
-              navClose(next);
+              // Force a second close shortly after the first navigation to reduce the chance
+              // that the token request lands on an already-established connection that started
+              // before tcpdump began writing.
+              sp2.set('pcap_step', '1');
+              const next1 = location.pathname + '?' + sp2.toString() + location.hash;
+              navClose(next1);
             } catch (e) {
               st.textContent = 'failed: ' + (e && e.message ? e.message : String(e));
               btn.disabled = false;
@@ -1258,6 +1286,7 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
           <table>
             <tr><td class="k">JA4</td><td class="v">` + htmlEscape(asString(p.TLS["ja4"])) + `</td></tr>
             <tr><td class="k">JA3</td><td class="v">` + htmlEscape(asString(p.TLS["ja3"])) + `</td></tr>
+            <tr><td class="k">TLS remote (ip:port)</td><td class="v">` + htmlEscape(asString(p.TLS["remote_addr"])) + `</td></tr>
             <tr><td class="k">TLS version</td><td class="v">` + htmlEscape(asString(p.TLS["version"])) + `</td></tr>
             <tr><td class="k">Cipher suite</td><td class="v">` + htmlEscape(asString(p.TLS["cipher_suite"])) + `</td></tr>
             <tr><td class="k">ALPN (agreed)</td><td class="v">` + htmlEscape(asString(p.TLS["alpn"])) + `</td></tr>

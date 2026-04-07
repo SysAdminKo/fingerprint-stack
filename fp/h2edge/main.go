@@ -58,6 +58,13 @@ type H2FP struct {
 type TLSFP struct {
 	JA3 string `json:"ja3,omitempty"`
 	JA4 string `json:"ja4,omitempty"`
+	// RemoteAddr is the client address for this TCP/TLS session (ip:port).
+	// It lets us correlate JSON snapshots with a specific TCP stream in pcaps.
+	RemoteAddr string `json:"remote_addr,omitempty"`
+	// ClientHelloRecordLen is the captured TLS record length in bytes (including 5-byte header).
+	ClientHelloRecordLen int `json:"client_hello_record_len,omitempty"`
+	// ClientHelloRecordHexPrefix is a short hex prefix of the captured TLS record bytes.
+	ClientHelloRecordHexPrefix string `json:"client_hello_record_hex_prefix,omitempty"`
 	CH  any    `json:"client_hello,omitempty"`
 	// Raw TLS records (base64). ClientHello is the first inbound handshake record.
 	ClientHelloRecordB64 string `json:"client_hello_record_b64,omitempty"`
@@ -342,6 +349,8 @@ func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.Rev
 		tlsfp.JA4 = computeJA4(chRaw, 't')
 		tlsfp.JA3 = computeJA3(chRaw)
 		tlsfp.CH = parseClientHello(chRaw)
+		tlsfp.ClientHelloRecordLen = len(chRaw)
+		tlsfp.ClientHelloRecordHexPrefix = hexPrefix(chRaw, 16)
 		tlsfp.ClientHelloRecordB64 = b64Trunc(chRaw, 48*1024)
 	}
 
@@ -364,6 +373,7 @@ func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.Rev
 	}
 
 	remote := raw.RemoteAddr().String()
+	tlsfp.RemoteAddr = remote
 
 	// Capture some initial frames, buffering bytes so we can replay them.
 	buf := &bytes.Buffer{}
@@ -458,8 +468,10 @@ func handleConn(raw net.Conn, tlsCfg *tls.Config, store *Store, rp *httputil.Rev
 					_, _ = lw.Write([]byte("{\"ok\":true}\n"))
 				}
 				go func() {
-					// Give browsers time to execute redirect JS before we kill the conn.
-					time.Sleep(800 * time.Millisecond)
+					// Give browsers time to receive/execute redirect JS before we kill the conn.
+					// Keeping this delay small helps ensure the next navigation opens a fresh TCP/TLS session
+					// while server-side tcpdump capture is running (so ClientHello is present in pcap).
+					time.Sleep(h2edgeCloseDelay())
 					_ = rc.Close()
 				}()
 				return
@@ -811,6 +823,16 @@ func b64Trunc(b []byte, max int) string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
+func hexPrefix(b []byte, n int) string {
+	if len(b) == 0 || n <= 0 {
+		return ""
+	}
+	if n > len(b) {
+		n = len(b)
+	}
+	return hex.EncodeToString(b[:n])
+}
+
 func newReverseProxy(upstream string) *httputil.ReverseProxy {
 	u, err := url.Parse(upstream)
 	if err != nil {
@@ -865,6 +887,9 @@ func injectHeaders(r *http.Request, st tls.ConnectionState, h2fp H2FP, tlsfp TLS
 	r.Header.Set("X-TLS-Proto", st.NegotiatedProtocol)
 	r.Header.Set("X-TLS-Resumed", fmt.Sprintf("%t", st.DidResume))
 	r.Header.Set("X-TLS-SNI", st.ServerName)
+	if tlsfp.RemoteAddr != "" {
+		r.Header.Set("X-TLS-Remote-Addr", tlsfp.RemoteAddr)
+	}
 
 	// JA3/JA4 + ClientHello tables
 	if tlsfp.JA4 != "" {
@@ -872,6 +897,12 @@ func injectHeaders(r *http.Request, st tls.ConnectionState, h2fp H2FP, tlsfp TLS
 	}
 	if tlsfp.JA3 != "" {
 		r.Header.Set("JA3", tlsfp.JA3)
+	}
+	if tlsfp.ClientHelloRecordLen > 0 {
+		r.Header.Set("X-TLS-ClientHello-Record-Len", fmt.Sprintf("%d", tlsfp.ClientHelloRecordLen))
+	}
+	if tlsfp.ClientHelloRecordHexPrefix != "" {
+		r.Header.Set("X-TLS-ClientHello-Record-Hex", tlsfp.ClientHelloRecordHexPrefix)
 	}
 	if tlsfp.ClientHelloRecordB64 != "" {
 		r.Header.Set("X-TLS-ClientHello-Record-B64", tlsfp.ClientHelloRecordB64)
@@ -1274,8 +1305,10 @@ func mapTLSVersionJA4(version uint16) string {
 	case 0x0302:
 		return "02"
 	case 0x0303:
-		return "13"
+		// TLS 1.2
+		return "12"
 	case 0x0304:
+		// TLS 1.3
 		return "13"
 	default:
 		return "00"
@@ -1365,7 +1398,8 @@ func computeJA4Internal(payload []byte, protocol byte) (string, error) {
 	extensions := make([]uint16, 0)
 	extensionCount := 0
 	sniFound := false
-	alpn := "00"
+	// Keep the full first ALPN string; JA4 encodes its first+last character.
+	alpn := ""
 	signatureAlgorithms := make([]uint16, 0)
 	supportedVersionsFound := false
 	highestSupportedVersion := uint16(0)
@@ -1414,12 +1448,7 @@ func computeJA4Internal(payload []byte, protocol byte) (string, error) {
 					return "", fmt.Errorf("incomplete ALPN string")
 				}
 				if alpnStrLen > 0 {
-					alpnStr := string(payload[alpnOffset : alpnOffset+alpnStrLen])
-					if len(alpnStr) >= 2 {
-						alpn = alpnStr[:2]
-					} else if len(alpnStr) == 1 {
-						alpn = alpnStr + "0"
-					}
+					alpn = string(payload[alpnOffset : alpnOffset+alpnStrLen])
 				}
 			}
 		}
@@ -1489,7 +1518,7 @@ func computeJA4Internal(payload []byte, protocol byte) (string, error) {
 	alpnLastChar := '0'
 	if len(alpn) >= 2 {
 		alpnFirstChar = rune(alpn[0])
-		alpnLastChar = rune(alpn[1])
+		alpnLastChar = rune(alpn[len(alpn)-1])
 	} else if len(alpn) == 1 {
 		alpnFirstChar = rune(alpn[0])
 		alpnLastChar = '0'
@@ -1644,5 +1673,18 @@ func env(k, def string) string {
 		return def
 	}
 	return v
+}
+
+func h2edgeCloseDelay() time.Duration {
+	// Default chosen to be long enough for the redirect HTML/JS to arrive,
+	// but short enough to force a new connection quickly.
+	s := strings.TrimSpace(os.Getenv("H2EDGE_CLOSE_DELAY_MS"))
+	if s == "" {
+		return 250 * time.Millisecond
+	}
+	if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 5000 {
+		return time.Duration(n) * time.Millisecond
+	}
+	return 250 * time.Millisecond
 }
 
