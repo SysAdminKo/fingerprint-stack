@@ -3,6 +3,8 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -235,5 +237,80 @@ func TestBuildPayload_smoke(t *testing.T) {
 	}
 	if et["request_interval_ms"].(int64) != 3 || et["prev_ttfb_ms"].(int64) != 4 {
 		t.Fatalf("edge_timing ms: %v", et)
+	}
+}
+
+func TestParseOSFromHeadersAndUA_fillsVersionFromUA(t *testing.T) {
+	t.Parallel()
+	h := map[string][]string{
+		"Sec-CH-UA-Platform": {`"Windows"`},
+	}
+	ua := `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0`
+	n, v := parseOSFromHeadersAndUA(h, ua)
+	if n != "Windows" || v != "10.0" {
+		t.Fatalf("got %q %q want Windows 10.0", n, v)
+	}
+}
+
+func TestParseOSFromUA(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		ua, wantOS, wantVer string
+	}{
+		{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120", "Windows", "10.0"},
+		{"Mozilla/5.0 (Linux; Android 14; Pixel) AppleWebKit", "Android", "14"},
+		{"Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X)", "iOS", "17.2"},
+		{"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", "macOS", "10.15.7"},
+		{"Mozilla/5.0 (X11; Linux x86_64)", "Linux", ""},
+	}
+	for _, tc := range cases {
+		osName, osVer := parseOSFromUA(tc.ua)
+		if osName != tc.wantOS || osVer != tc.wantVer {
+			t.Fatalf("UA %q: got %q %q want %q %q", tc.ua, osName, osVer, tc.wantOS, tc.wantVer)
+		}
+	}
+}
+
+func TestBuildPcapDownloadStem(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "snap-api-all.json")
+	j := `{
+  "request": {
+    "browser": "Chrome",
+    "browser_version": "120",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0)"
+  },
+  "headers": {
+    "Sec-CH-UA-Platform": ["\"Windows\""],
+    "Sec-CH-UA-Platform-Version": ["\"15.0.0\""]
+  }
+}
+`
+	if err := os.WriteFile(p, []byte(j), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	job := &pcapJob{}
+	stem := buildPcapDownloadStem(job, p, "fallback")
+	if stem != "null, null, auto Windows 15.0.0, auto Chrome 120" {
+		t.Fatalf("stem %q", stem)
+	}
+	job2 := &pcapJob{UserOSLabel: "Windows 11", UserBrowserLabel: "Chrome 131"}
+	stem2 := buildPcapDownloadStem(job2, p, "fallback")
+	if stem2 != "Windows 11, Chrome 131, auto Windows 15.0.0, auto Chrome 120" {
+		t.Fatalf("stem with user labels %q", stem2)
+	}
+	job3 := &pcapJob{UserOSLabel: "Windows 11"}
+	stem3 := buildPcapDownloadStem(job3, p, "fallback")
+	if stem3 != "Windows 11, null, auto Windows 15.0.0, auto Chrome 120" {
+		t.Fatalf("stem one user field %q", stem3)
+	}
+	stMissing := buildPcapDownloadStem(job, filepath.Join(dir, "missing.json"), "fb")
+	if stMissing != "null, null, auto unknown OS, auto unknown browser" {
+		t.Fatalf("missing json: %q", stMissing)
+	}
+	stPartial := buildPcapDownloadStem(&pcapJob{UserOSLabel: "My OS"}, filepath.Join(dir, "missing.json"), "fb")
+	if stPartial != "My OS, null, auto unknown OS, auto unknown browser" {
+		t.Fatalf("missing file with user label: %q", stPartial)
 	}
 }

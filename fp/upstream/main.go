@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"archive/zip"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -11,9 +10,11 @@ import (
 	"net"
 	"net/netip"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,15 +35,17 @@ type Payload struct {
 }
 
 type pcapJob struct {
-	Token     string
-	TargetIP  string
-	Path      string
-	Ready     bool
-	Started   bool
-	Err       string
-	StartedAt time.Time
-	EndedAt   time.Time // tcpdump finished; used for journalctl --until (stable if ZIP downloaded later)
-	DurS      int
+	Token            string
+	TargetIP         string
+	Path             string
+	Ready            bool
+	Started          bool
+	Err              string
+	StartedAt        time.Time
+	EndedAt          time.Time // tcpdump finished; used for journalctl --until (stable if pcap downloaded later)
+	DurS             int
+	UserOSLabel      string // optional: from UI for download filename
+	UserBrowserLabel string
 }
 
 type loggingResponseWriter struct {
@@ -324,11 +327,13 @@ func main() {
 		path := filepath.Join(pcapSaveDir, base+".pcap")
 
 		job := &pcapJob{
-			Token:     token,
-			TargetIP:  targetIP,
-			Path:      path,
-			StartedAt: time.Now(),
-			DurS:      durS,
+			Token:            token,
+			TargetIP:         targetIP,
+			Path:             path,
+			StartedAt:        time.Now(),
+			DurS:             durS,
+			UserOSLabel:      clampPcapUserLabel(r.URL.Query().Get("user_os"), 120),
+			UserBrowserLabel: clampPcapUserLabel(r.URL.Query().Get("user_browser"), 120),
 		}
 		jobsMu.Lock()
 		jobs[token] = job
@@ -441,46 +446,31 @@ func main() {
 			writeJSON(w, map[string]any{"error": job.Err, "token": token})
 			return
 		}
-		filename := filepath.Base(job.Path)
+		diskPcapName := filepath.Base(job.Path)
+		fallbackStem := strings.TrimSuffix(diskPcapName, ".pcap")
+		jsonPath := strings.TrimSuffix(job.Path, ".pcap") + "-api-all.json"
+		stem := buildPcapDownloadStem(job, jsonPath, fallbackStem)
+		pcapName := stem + ".pcap"
 		if probe {
-			writeJSON(w, map[string]any{"status": "ready", "token": token, "filename": filename})
+			writeJSON(w, map[string]any{"status": "ready", "token": token, "filename": pcapName})
 			return
 		}
-		// Return a ZIP archive containing both .pcap and api-all snapshot JSON.
-		jsonPath := strings.TrimSuffix(job.Path, ".pcap") + "-api-all.json"
-		zipName := strings.TrimSuffix(filename, ".pcap") + ".zip"
+		// Download filename: optional user labels + auto-detected OS/browser (see buildPcapDownloadStem); disk path unchanged.
 
-		w.Header().Set("Content-Type", "application/zip")
-		w.Header().Set("Content-Disposition", `attachment; filename="`+zipName+`"`)
+		f, err := os.Open(job.Path)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, map[string]any{"error": err.Error(), "token": token})
+			return
+		}
+		defer f.Close()
+
+		w.Header().Set("Content-Type", "application/vnd.tcpdump.pcap")
+		w.Header().Set("Content-Disposition", attachmentContentDisposition(pcapName))
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(200)
-
-		zw := zip.NewWriter(w)
-		defer func() { _ = zw.Close() }()
-
-		if err := zipAddFile(zw, filename, job.Path); err != nil {
-			log.Printf("zip add pcap error: %v", err)
-			return
-		}
-		// Add JSON snapshot if available; otherwise include an error stub.
-		if _, err := os.Stat(jsonPath); err == nil {
-			_ = zipAddFile(zw, filepath.Base(jsonPath), jsonPath)
-		} else {
-			fw, _ := zw.Create(filepath.Base(strings.TrimSuffix(filename, ".pcap") + "-api-all.json"))
-			_, _ = io.WriteString(fw, "{\"error\":\"api-all snapshot not found (try reloading the page with pcap_token during capture)\"}\n")
-		}
-		logPath := strings.TrimSuffix(job.Path, ".pcap") + "-h2edge.log"
-		if _, err := os.Stat(logPath); err != nil {
-			end := job.EndedAt
-			if end.IsZero() {
-				end = job.StartedAt.Add(time.Duration(job.DurS) * time.Second)
-			}
-			writePcapH2EdgeLog(logPath, job.Token, job.StartedAt, end, h2edgeJournalUnit, job.TargetIP)
-		}
-		if _, err := os.Stat(logPath); err == nil {
-			if err := zipAddFile(zw, filepath.Base(logPath), logPath); err != nil {
-				log.Printf("zip add h2edge log error: %v", err)
-			}
+		if _, err := io.Copy(w, f); err != nil {
+			log.Printf("pcap download copy: %v", err)
 		}
 	})
 	mux.HandleFunc("/api/pcap", func(w http.ResponseWriter, r *http.Request) {
@@ -535,9 +525,16 @@ func main() {
 			return
 		}
 
-		filename := "handshake-" + time.Now().UTC().Format("20060102T150405Z") + "-" + strings.ReplaceAll(targetIP, ":", "_") + ".pcap"
+		job := &pcapJob{
+			UserOSLabel:      clampPcapUserLabel(r.URL.Query().Get("user_os"), 120),
+			UserBrowserLabel: clampPcapUserLabel(r.URL.Query().Get("user_browser"), 120),
+		}
+		brName, brVer := parseBrowser(r)
+		osName, osVer := parseOS(r)
+		stem := buildDownloadStemFromAuto(job.UserOSLabel, job.UserBrowserLabel, autoBrowserOS{brName, brVer, osName, osVer})
+		filename := stem + ".pcap"
 		w.Header().Set("Content-Type", "application/vnd.tcpdump.pcap")
-		w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+		w.Header().Set("Content-Disposition", attachmentContentDisposition(filename))
 		w.WriteHeader(200)
 
 		_, copyErr := io.Copy(w, stdout)
@@ -572,27 +569,215 @@ func randToken(n int) string {
 	return string(out)
 }
 
-func zipAddFile(zw *zip.Writer, name string, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+func stripCHQuotes(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, `"`)
+	return strings.TrimSpace(s)
+}
 
-	info, _ := f.Stat()
-	h := &zip.FileHeader{
-		Name:   name,
-		Method: zip.Deflate,
+func headerFirstCI(h map[string][]string, want string) string {
+	if h == nil {
+		return ""
 	}
-	if info != nil {
-		h.SetModTime(info.ModTime())
+	wl := strings.ToLower(want)
+	for k, vs := range h {
+		if strings.ToLower(k) == wl && len(vs) > 0 {
+			return strings.TrimSpace(vs[0])
+		}
 	}
-	w, err := zw.CreateHeader(h)
+	return ""
+}
+
+// parseOSFromHeadersAndUA prefers Client Hints when present, but if only the platform name is
+// sent (common: Sec-CH-UA-Platform without Sec-CH-UA-Platform-Version on first visit — the full
+// version hint requires Accept-CH / a prior response), the version is taken from User-Agent
+// (e.g. Windows NT 10.0 → 10.0).
+func parseOSFromHeadersAndUA(h map[string][]string, ua string) (name, version string) {
+	plat := stripCHQuotes(headerFirstCI(h, "Sec-CH-UA-Platform"))
+	platVer := stripCHQuotes(headerFirstCI(h, "Sec-CH-UA-Platform-Version"))
+	if plat == "" && platVer == "" {
+		return parseOSFromUA(ua)
+	}
+	uaName, uaVer := parseOSFromUA(ua)
+	name = plat
+	version = platVer
+	if name == "" {
+		name = uaName
+	}
+	if version == "" {
+		version = uaVer
+	}
+	return name, version
+}
+
+var (
+	reOSWindowsNT = regexp.MustCompile(`Windows NT ([0-9.]+)`)
+	reOSAndroid   = regexp.MustCompile(`Android ([0-9]+(?:\.[0-9]+)*)`)
+	reOSIOS       = regexp.MustCompile(`(?:CPU iPhone OS|CPU OS|iPhone OS) ([0-9_]+)`)
+	reOSMac       = regexp.MustCompile(`Mac OS X ([0-9_]+)`)
+)
+
+func parseOSFromUA(ua string) (name, version string) {
+	ua = strings.TrimSpace(ua)
+	if ua == "" {
+		return "", ""
+	}
+	if m := reOSWindowsNT.FindStringSubmatch(ua); len(m) >= 2 {
+		return "Windows", m[1]
+	}
+	if m := reOSAndroid.FindStringSubmatch(ua); len(m) >= 2 {
+		return "Android", m[1]
+	}
+	if m := reOSIOS.FindStringSubmatch(ua); len(m) >= 2 {
+		return "iOS", strings.ReplaceAll(m[1], "_", ".")
+	}
+	if m := reOSMac.FindStringSubmatch(ua); len(m) >= 2 {
+		return "macOS", strings.ReplaceAll(m[1], "_", ".")
+	}
+	if strings.Contains(ua, "Linux") {
+		return "Linux", ""
+	}
+	return "", ""
+}
+
+func parseOS(r *http.Request) (name, version string) {
+	return parseOSFromHeadersAndUA(r.Header, firstHeader(r, "User-Agent"))
+}
+
+func clampPcapUserLabel(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if max <= 0 {
+		max = 120
+	}
+	r := []rune(s)
+	if len(r) > max {
+		s = string(r[:max])
+	}
+	return strings.TrimSpace(s)
+}
+
+// autoBrowserOS holds detected browser/OS strings for the "auto …" segment of download filenames.
+type autoBrowserOS struct {
+	brName, brVer, osName, osVer string
+}
+
+func parseAutoBrowserOSFromJSONFile(jsonPath string) (autoBrowserOS, bool) {
+	b, err := os.ReadFile(jsonPath)
 	if err != nil {
-		return err
+		return autoBrowserOS{}, false
 	}
-	_, err = io.Copy(w, f)
-	return err
+	var snap struct {
+		Request map[string]any      `json:"request"`
+		Headers map[string][]string `json:"headers"`
+	}
+	if err := json.Unmarshal(b, &snap); err != nil {
+		return autoBrowserOS{}, false
+	}
+	brName := strings.TrimSpace(asString(snap.Request["browser"]))
+	brVer := strings.TrimSpace(asString(snap.Request["browser_version"]))
+	ua := asString(snap.Request["user_agent"])
+	if brName == "" {
+		bn, bv := parseBrowserFromUA(ua)
+		brName, brVer = bn, bv
+	}
+	osName, osVer := parseOSFromHeadersAndUA(snap.Headers, ua)
+	return autoBrowserOS{brName, brVer, osName, osVer}, true
+}
+
+// pcapUserFieldOrNull returns the trimmed user input, or the literal "null" if empty.
+func pcapUserFieldOrNull(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "null"
+	}
+	return strings.TrimSpace(s)
+}
+
+// buildDownloadStemFromAuto builds: [user OS or null], [user browser or null], auto <detected OS>, auto <detected browser>.
+// Empty input fields are represented as the literal "null". Detected chunks are prefixed with "auto ".
+func buildDownloadStemFromAuto(userOS, userBrowser string, auto autoBrowserOS) string {
+	autoBr := strings.TrimSpace(strings.TrimSpace(auto.brName + " " + auto.brVer))
+	autoOS := strings.TrimSpace(strings.TrimSpace(auto.osName + " " + auto.osVer))
+	if autoBr == "" {
+		autoBr = "unknown browser"
+	}
+	if autoOS == "" {
+		autoOS = "unknown OS"
+	}
+	autoSeg := "auto " + autoOS + ", auto " + autoBr
+
+	userSeg := pcapUserFieldOrNull(userOS) + ", " + pcapUserFieldOrNull(userBrowser)
+	stem := userSeg + ", " + autoSeg
+	return sanitizeDownloadFilename(stem)
+}
+
+func buildPcapDownloadStem(job *pcapJob, jsonPath, fallbackStem string) string {
+	if job == nil {
+		job = &pcapJob{}
+	}
+	auto, ok := parseAutoBrowserOSFromJSONFile(jsonPath)
+	if !ok {
+		stem := buildDownloadStemFromAuto(job.UserOSLabel, job.UserBrowserLabel, autoBrowserOS{"unknown browser", "", "unknown OS", ""})
+		if stem == "" {
+			return fallbackStem
+		}
+		return stem
+	}
+	stem := buildDownloadStemFromAuto(job.UserOSLabel, job.UserBrowserLabel, auto)
+	if stem == "" {
+		return fallbackStem
+	}
+	return stem
+}
+
+func sanitizeDownloadFilename(s string) string {
+	s = strings.TrimSpace(s)
+	repl := strings.NewReplacer(
+		`/`, "-", `\`, "-", `:`, "-", `*`, "", `?`, "", `"`, "'", `<`, "", `>`, "", `|`, "-",
+	)
+	s = repl.Replace(s)
+	var b strings.Builder
+	for _, r := range s {
+		if r < 32 || r == 127 {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	s = strings.TrimSpace(b.String())
+	if len(s) > 240 {
+		s = strings.TrimRight(s[:240], " .")
+	}
+	return s
+}
+
+func sanitizeASCIIFilenameFallback(filename string) string {
+	var b strings.Builder
+	for _, r := range filename {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == ' ', r == '-', r == '_', r == '.', r == ',', r == '(', r == ')':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	out := strings.Trim(b.String(), " ._")
+	if out == "" {
+		return ""
+	}
+	if len(out) > 120 {
+		out = out[:120]
+		out = strings.TrimRight(out, " ._")
+	}
+	return out
+}
+
+func attachmentContentDisposition(filename string) string {
+	fb := sanitizeASCIIFilenameFallback(filename)
+	if fb == "" {
+		fb = "download.bin"
+	}
+	return `attachment; filename="` + fb + `"; filename*=UTF-8''` + url.PathEscape(filename)
 }
 
 // writePcapH2EdgeLog pulls fp-h2edge journal lines for this capture. Includes:
@@ -771,6 +956,8 @@ func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 		return firstHeaderAnyCase(r, k)
 	}
 
+	brName, brVer := parseBrowser(r)
+
 	tls := map[string]any{
 		"ja4":         edgeHeader("X-JA4"),
 		"ja3":         edgeHeaderAnyCase("JA3"), // edge sets request header "JA3"
@@ -841,6 +1028,8 @@ func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 		hdrs[k] = v
 	}
 
+	osName, osVer := parseOSFromHeadersAndUA(hdrs, firstHeader(r, "User-Agent"))
+
 	req := map[string]any{
 		"method":       r.Method,
 		"host":         r.Host,
@@ -854,7 +1043,11 @@ func buildPayload(r *http.Request, trusted trustedProxySet) Payload {
 		"remote_port":  raPort,
 		"client_ip":    clientIP,
 		"xff":          xff,
-		"user_agent":   firstHeader(r, "User-Agent"),
+		"user_agent":      firstHeader(r, "User-Agent"),
+		"browser":         brName,
+		"browser_version": brVer,
+		"os_name":         osName,
+		"os_version":      osVer,
 		"accept":       firstHeader(r, "Accept"),
 		"accept_lang":  firstHeader(r, "Accept-Language"),
 		"accept_enc":   firstHeader(r, "Accept-Encoding"),
@@ -905,6 +1098,9 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
 		hostForTitle = "localhost"
 	}
 
+	autoOSLabel := joinNameVer(asString(p.Request["os_name"]), asString(p.Request["os_version"]))
+	autoBrLabel := joinNameVer(asString(p.Request["browser"]), asString(p.Request["browser_version"]))
+
 	return `<!doctype html>
 <html lang="en">
   <head>
@@ -921,10 +1117,16 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
       section { border: 1px solid rgba(127,127,127,.25); border-radius: 14px; overflow: hidden; }
       section > h2 { margin: 0; padding: 12px 14px; font-size: 14px; letter-spacing: .04em; text-transform: uppercase; border-bottom: 1px solid rgba(127,127,127,.25); }
       pre { margin: 0; padding: 12px 14px; overflow: auto; font-size: 12.5px; line-height: 1.45; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
-      table { width: 100%; border-collapse: collapse; }
+      table { width: 100%; border-collapse: collapse; table-layout: fixed; }
       td { padding: 10px 12px; vertical-align: top; border-bottom: 1px solid rgba(127,127,127,.18); }
-      td.k { width: 34%; font-weight: 650; opacity: .9; }
-      td.v { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12.5px; }
+      td.k { width: 34%; min-width: 160px; font-weight: 650; opacity: .9; }
+      td.v {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        font-size: 12.5px;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
       a { color: inherit; }
       .row { display:flex; gap:12px; flex-wrap:wrap; align-items:baseline; }
       .row2 { display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:space-between; }
@@ -966,6 +1168,45 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
         line-height: 1.45;
         opacity: .95;
       }
+      .pcap-labels { display: grid; gap: 10px; margin-top: 12px; width: 100%; max-width: 520px; }
+      .pcap-field { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+      .pcap-field label { font-size: 12.5px; font-weight: 650; opacity: .95; }
+      .pcap-field input[type="text"] {
+        width: 100%; max-width: 480px; box-sizing: border-box;
+        border: 1px solid rgba(127,127,127,.35); background: transparent; color: inherit;
+        border-radius: 10px; padding: 8px 10px; font-size: 13px;
+      }
+      .pcap-field input[type="text"]::placeholder { opacity: .55; }
+      .pcap-field input[type="text"]:focus { outline: 2px solid color-mix(in oklab, Highlight, transparent 55%); outline-offset: 2px; }
+      .pcap-hint { font-size: 13.5px; opacity: .9; line-height: 1.5; }
+      .pcap-hint-block { display: block; max-width: 520px; margin-top: 2px; }
+      .pcap-hint-block strong { font-weight: 650; opacity: .95; }
+      .pcap-hint-lead {
+        color: #ff0000;
+        font-weight: 750;
+        margin-right: 2px;
+      }
+      @media (prefers-color-scheme: dark) {
+        .pcap-hint-lead { color: #ff5252; }
+      }
+      .pcap-auto-copy {
+        margin-left: 4px;
+        display: inline-block;
+        vertical-align: baseline;
+        font: inherit;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        font-size: 12.5px;
+        cursor: pointer;
+        border: 1px solid rgba(127,127,127,.4);
+        border-radius: 8px;
+        padding: 2px 8px 3px;
+        background: color-mix(in oklab, canvas, transparent 6%);
+        color: inherit;
+      }
+      .pcap-auto-copy:hover { border-color: rgba(127,127,127,.65); }
+      .pcap-auto-copy:focus { outline: 2px solid color-mix(in oklab, Highlight, transparent 55%); outline-offset: 2px; }
+      .pcap-auto-copy.pcap-copied { border-color: color-mix(in oklab, Highlight, transparent 35%); }
+      .pcap-auto-placeholder { opacity: .65; font-style: italic; }
       .disclaimer .actions {
         margin-top: 12px;
         display: flex;
@@ -983,6 +1224,28 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
       }
       pre.json-block { max-height: 280px; margin: 0; padding: 12px 14px; overflow: auto; font-size: 12px; line-height: 1.45; }
       section.subhint { padding: 0 14px 12px 14px; font-size: 12px; opacity: .8; border-top: 1px solid rgba(127,127,127,.12); }
+      details.fold { margin: 0; }
+      details.fold > summary {
+        list-style: none;
+        cursor: pointer;
+        user-select: none;
+        padding: 12px 14px;
+        font-weight: 800;
+        font-size: 16px;
+        border-bottom: 1px solid rgba(127,127,127,.18);
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      details.fold > summary::-webkit-details-marker { display: none; }
+      details.fold > summary::before {
+        content: "▸";
+        width: 14px;
+        opacity: .85;
+        transform: translateY(-1px);
+      }
+      details.fold[open] > summary::before { content: "▾"; }
+      details.fold > .fold-body { padding: 10px 14px 12px 14px; }
     </style>
   </head>
   <body>
@@ -1161,8 +1424,42 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
         function init() {
           const btn = document.getElementById('pcap_btn');
           const dur = document.getElementById('pcap_dur');
+          const pcapUserOs = document.getElementById('pcap_user_os');
+          const pcapUserBr = document.getElementById('pcap_user_browser');
           st = document.getElementById('pcap_status');
           if (!btn || !dur || !st) return;
+
+          (function bindPcapAutoCopy() {
+            const root = document.querySelector('.pcap-labels');
+            if (!root) return;
+            root.addEventListener('click', function(ev) {
+              const el = ev.target.closest('.pcap-auto-copy');
+              if (!el) return;
+              ev.preventDefault();
+              const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+              if (!txt) return;
+              const tgt = el.getAttribute('data-pcap-fill');
+              if (tgt === 'os') {
+                const inp = document.getElementById('pcap_user_os');
+                if (inp) inp.value = txt;
+              } else if (tgt === 'browser') {
+                const inp = document.getElementById('pcap_user_browser');
+                if (inp) inp.value = txt;
+              }
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(txt).then(function() {
+                  el.classList.add('pcap-copied');
+                  setTimeout(function() { el.classList.remove('pcap-copied'); }, 900);
+                }).catch(function() {
+                  el.classList.add('pcap-copied');
+                  setTimeout(function() { el.classList.remove('pcap-copied'); }, 900);
+                });
+              } else {
+                el.classList.add('pcap-copied');
+                setTimeout(function() { el.classList.remove('pcap-copied'); }, 900);
+              }
+            });
+          })();
 
           // If page loaded with a token, poll and download automatically.
           const sp = new URLSearchParams(location.search);
@@ -1228,7 +1525,13 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
             st.textContent = 'starting capture...';
             const durS = parseInt(dur.value || '3', 10) || 3;
             try {
-              const resp = await fetch('/api/pcap/start?dur_s=' + encodeURIComponent(String(durS)), { cache: 'no-store' });
+              const qs = new URLSearchParams();
+              qs.set('dur_s', String(durS));
+              const uo = pcapUserOs && String(pcapUserOs.value || '').trim();
+              const ub = pcapUserBr && String(pcapUserBr.value || '').trim();
+              if (uo) qs.set('user_os', uo);
+              if (ub) qs.set('user_browser', ub);
+              const resp = await fetch('/api/pcap/start?' + qs.toString(), { cache: 'no-store' });
               if (!resp.ok) throw new Error('HTTP ' + resp.status);
               const j = await resp.json();
               if (!j || !j.token) throw new Error('bad response');
@@ -1263,15 +1566,27 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
         <h2>Notice: what gets collected & saved</h2>
         <div class="box">
           <div class="text">
-            Нажимая <code>Capture .pcap</code>, вы запускаете серверный <code>tcpdump</code>. Будет сохранён <code>.pcap</code> с пакетами TCP/443 для вашего IP за выбранное время, рядом — снапшот <code>/api/all</code> (headers и fingerprints: JA3/JA4, TLS/ClientHello, H2/HTTP, p0f, TTL) и фрагмент journal <code>fp-h2edge</code> с вашим <code>pcap_token</code> (нужны <code>H2EDGE_ACCESS_LOG=1</code> на edge; при скачивании ZIP — три файла). Файлы сохраняются на сервере в <code>FP_PCAP_SAVE_DIR</code>.
+            Нажимая <code>Capture .pcap</code>, вы запускаете серверный <code>tcpdump</code>. Будет сохранён <code>.pcap</code> с пакетами TCP/443 для вашего IP за выбранное время, рядом на сервере — снапшот <code>/api/all</code> (headers и fingerprints: JA3/JA4, TLS/ClientHello, H2/HTTP, p0f, TTL) и фрагмент journal <code>fp-h2edge</code> с вашим <code>pcap_token</code> (нужны <code>H2EDGE_ACCESS_LOG=1</code> на edge). Скачивание отдаёт только <code>.pcap</code>. Файлы сохраняются на сервере в <code>FP_PCAP_SAVE_DIR</code>.
+          </div>
+          <div class="pcap-labels">
+            <div class="pcap-field">
+              <label for="pcap_user_os">Операционная система и её версия</label>
+              <input type="text" id="pcap_user_os" name="user_os" maxlength="120" autocomplete="off" placeholder="например: Windows 11" />
+              <span class="pcap-hint pcap-hint-block"><span class="pcap-hint-lead">Как вводить:</span> укажите систему и номер версии <strong>полностью</strong>, вплоть до последнего значащего знака (как в сведениях об ОС: <code>winver</code>, <code>sw_vers</code>, <code>uname -a</code>). <strong>Авто по этому запросу</strong> — нажмите, чтобы подставить в поле (и в буфер обмена): ` + pcapHintAutoChip(autoOSLabel, "os") + `</span>
+            </div>
+            <div class="pcap-field">
+              <label for="pcap_user_browser">Браузер и его версия</label>
+              <input type="text" id="pcap_user_browser" name="user_browser" maxlength="120" autocomplete="off" placeholder="например: Chrome 131" />
+              <span class="pcap-hint pcap-hint-block"><span class="pcap-hint-lead">Как вводить:</span> укажите браузер и версию <strong>полностью</strong>, вплоть до последнего знака в номере (как в «О браузере» / <code>chrome://version</code> и т.п.). <strong>Авто по этому запросу</strong> — нажмите, чтобы подставить в поле (и в буфер обмена): ` + pcapHintAutoChip(autoBrLabel, "browser") + `</span>
+            </div>
           </div>
           <div class="actions">
             <label class="status" for="pcap_dur">pcap:</label>
             <select id="pcap_dur" aria-label="pcap duration seconds">
               <option value="1">1s</option>
               <option value="2">2s</option>
-              <option value="3" selected>3s</option>
-              <option value="5">5s</option>
+              <option value="3">3s</option>
+              <option value="5" selected>5s</option>
               <option value="8">8s</option>
               <option value="10">10s</option>
             </select>
@@ -1304,6 +1619,7 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
             <tr><td class="k">Host</td><td class="v">` + htmlEscape(asString(p.Request["host"])) + `</td></tr>
             <tr><td class="k">URI</td><td class="v">` + htmlEscape(asString(p.Request["uri"])) + `</td></tr>
             <tr><td class="k">Proto (client)</td><td class="v">` + htmlEscape(asString(p.Request["proto"])) + `</td></tr>
+            <tr><td class="k">Browser</td><td class="v">` + htmlEscape(asString(p.Request["browser"])) + ` ` + htmlEscape(asString(p.Request["browser_version"])) + `</td></tr>
             <tr><td class="k">User-Agent</td><td class="v">` + htmlEscape(asString(p.Request["user_agent"])) + `</td></tr>
             <tr><td class="k">Accept</td><td class="v">` + htmlEscape(asString(p.Request["accept"])) + `</td></tr>
             <tr><td class="k">Accept-Language</td><td class="v">` + htmlEscape(asString(p.Request["accept_lang"])) + `</td></tr>
@@ -1410,8 +1726,18 @@ func renderHTML(p Payload, publicHost string, wsPublicURL string, wsFanout int, 
         <pre>` + htmlEscape(joinU16Lines(ciphers, 12)) + `</pre>
       </section>
 
-      <section><h2>Raw headers</h2><pre>` + htmlEscape(string(prettyHdr)) + `</pre></section>
-      <section><h2>All collected data (JSON)</h2><pre>` + htmlEscape(string(prettyAll)) + `</pre></section>
+      <section>
+        <details class="fold">
+          <summary>Raw headers</summary>
+          <div class="fold-body"><pre>` + htmlEscape(string(prettyHdr)) + `</pre></div>
+        </details>
+      </section>
+      <section>
+        <details class="fold">
+          <summary>All collected data (JSON)</summary>
+          <div class="fold-body"><pre>` + htmlEscape(string(prettyAll)) + `</pre></div>
+        </details>
+      </section>
     </main>
   </body>
 </html>`
@@ -1423,6 +1749,143 @@ func writeJSON(w http.ResponseWriter, v any) {
 	// Do not force status=200 here; some handlers intentionally set non-200 (e.g. 202 while capturing).
 	_, _ = w.Write(b)
 	_, _ = w.Write([]byte("\n"))
+}
+
+func parseBrowser(r *http.Request) (name string, version string) {
+	uaName, uaVer := parseBrowserFromUA(firstHeader(r, "User-Agent"))
+	chName, chVer := parseBrowserFromCH(r)
+
+	if chName == "" {
+		return uaName, uaVer
+	}
+	// If CH only tells us "Chromium"/"Chrome" but UA has a more specific brand
+	// (Opera/Edge/YaBrowser), prefer the UA result.
+	switch strings.ToLower(strings.TrimSpace(chName)) {
+	case "chromium", "chrome", "google chrome":
+		switch strings.ToLower(strings.TrimSpace(uaName)) {
+		case "opera", "edge", "yabrowser":
+			if uaVer != "" {
+				return uaName, uaVer
+			}
+		}
+	}
+	return chName, chVer
+}
+
+func parseBrowserFromCH(r *http.Request) (name string, version string) {
+	// Chromium-based browsers often provide brand/version info via Client Hints.
+	// We accept either full version list or the basic Sec-CH-UA list.
+	full := strings.TrimSpace(firstHeaderAnyCase(r, "Sec-CH-UA-Full-Version-List"))
+	if full == "" {
+		full = strings.TrimSpace(firstHeaderAnyCase(r, "Sec-Ch-Ua-Full-Version-List"))
+	}
+	if full != "" {
+		// Example:
+		//  "Not(A:Brand";v="8", "Chromium";v="144", "YaBrowser";v="26.3"
+		type bv struct{ b, v string }
+		pairs := parseCHBrandVersions(full)
+		if n, v := pickBestBrowserPair(pairs); n != "" {
+			return n, v
+		}
+	}
+
+	ua := strings.TrimSpace(firstHeaderAnyCase(r, "Sec-CH-UA"))
+	if ua == "" {
+		ua = strings.TrimSpace(firstHeaderAnyCase(r, "Sec-Ch-Ua"))
+	}
+	if ua != "" {
+		// Basic list has brands but version is often truncated.
+		pairs := parseCHBrandVersions(ua)
+		if n, v := pickBestBrowserPair(pairs); n != "" {
+			return n, v
+		}
+	}
+	return "", ""
+}
+
+func parseCHBrandVersions(s string) []struct{ b, v string } {
+	// Parse `"Brand";v="123"` pairs.
+	re := regexp.MustCompile(`"([^"]+)"\s*;\s*v="([^"]+)"`)
+	m := re.FindAllStringSubmatch(s, -1)
+	out := make([]struct{ b, v string }, 0, len(m))
+	for _, mm := range m {
+		if len(mm) < 3 {
+			continue
+		}
+		b := strings.TrimSpace(mm[1])
+		v := strings.TrimSpace(mm[2])
+		if b == "" {
+			continue
+		}
+		out = append(out, struct{ b, v string }{b: b, v: v})
+	}
+	return out
+}
+
+func pickBestBrowserPair(pairs []struct{ b, v string }) (name, version string) {
+	// Prefer “real” brands over GREASE-like placeholders.
+	// Order tuned for this project (Yandex is common in your traffic).
+	prefer := []string{
+		"YaBrowser",
+		"Yandex",
+		"Yandex Browser",
+		"Google Chrome",
+		"Chrome",
+		"Chromium",
+		"Microsoft Edge",
+		"Edge",
+		"Opera",
+		"Firefox",
+		"Safari",
+	}
+
+	norm := func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+	byNorm := map[string]struct{ b, v string }{}
+	for _, p := range pairs {
+		byNorm[norm(p.b)] = p
+	}
+	for _, p := range prefer {
+		if v, ok := byNorm[norm(p)]; ok {
+			return v.b, v.v
+		}
+	}
+	// As a last resort, pick first non-placeholder.
+	for _, p := range pairs {
+		bn := norm(p.b)
+		if strings.Contains(bn, "not") && strings.Contains(bn, "brand") {
+			continue
+		}
+		return p.b, p.v
+	}
+	return "", ""
+}
+
+func parseBrowserFromUA(ua string) (name string, version string) {
+	ua = strings.TrimSpace(ua)
+	if ua == "" {
+		return "", ""
+	}
+	// Order matters.
+	type rule struct {
+		name string
+		re   *regexp.Regexp
+	}
+	rules := []rule{
+		{name: "YaBrowser", re: regexp.MustCompile(`\bYaBrowser/([0-9]+(?:\.[0-9]+)*)`)},
+		{name: "Edge", re: regexp.MustCompile(`\bEdg/([0-9]+(?:\.[0-9]+)*)`)},
+		{name: "Opera", re: regexp.MustCompile(`\bOPR/([0-9]+(?:\.[0-9]+)*)`)},
+		{name: "Firefox", re: regexp.MustCompile(`\bFirefox/([0-9]+(?:\.[0-9]+)*)`)},
+		// Safari on iOS/macOS usually has Version/x.y and Safari/…
+		{name: "Safari", re: regexp.MustCompile(`\bVersion/([0-9]+(?:\.[0-9]+)*)\b.*\bSafari/`)},
+		{name: "Chrome", re: regexp.MustCompile(`\bChrome/([0-9]+(?:\.[0-9]+)*)`)},
+	}
+	for _, rr := range rules {
+		m := rr.re.FindStringSubmatch(ua)
+		if len(m) >= 2 {
+			return rr.name, m[1]
+		}
+	}
+	return "", ""
 }
 
 func mustJSONList[T any](s string) any {
@@ -1482,6 +1945,33 @@ func splitHostPort(addr string) (string, string) {
 		return addr, ""
 	}
 	return h, p
+}
+
+func joinNameVer(name, ver string) string {
+	name = strings.TrimSpace(name)
+	ver = strings.TrimSpace(ver)
+	switch {
+	case name == "" && ver == "":
+		return ""
+	case ver == "":
+		return name
+	case name == "":
+		return ver
+	default:
+		return name + " " + ver
+	}
+}
+
+// pcapHintAutoChip renders a chip for auto-detected OS or browser; field is "os" or "browser" for data-pcap-fill.
+func pcapHintAutoChip(nameVer, field string) string {
+	nameVer = strings.TrimSpace(nameVer)
+	if nameVer == "" {
+		return `<span class="pcap-auto-placeholder" title="Не удалось автоопределить на этом запросе">нет данных</span>`
+	}
+	if field != "os" && field != "browser" {
+		field = "os"
+	}
+	return `<button type="button" class="pcap-auto-copy" data-pcap-fill="` + field + `" title="Подставить автоопределённое значение в поле ввода">` + htmlEscape(nameVer) + `</button>`
 }
 
 func htmlEscape(s string) string {
